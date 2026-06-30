@@ -206,27 +206,32 @@ async def send_telegram(message: str):
 # SUBSCRIPTION LINK BUILDER
 # ─────────────────────────────────────────────────────────────────────────────
 async def build_vless_link(user_uuid: str, user_name: str, flag: str = "") -> str:
+    from urllib.parse import quote
     domain = DOMAIN
-    ws_path = await get_setting("ws_path", "/vless-ws")
     sni = await get_setting("sni", domain)
     host_header = await get_setting("host_header", domain)
     fp = await get_setting("tls_fingerprint", "chrome")
     fragment = await get_setting("fragment", "")
 
-    params = [
-        f"type=ws",
-        f"security=tls",
-        f"path={ws_path}",
-        f"host={host_header}",
-        f"sni={sni}",
-        f"fp={fp}",
-    ]
-    if fragment:
-        params.append(f"fragment={fragment}")
+    # Per-user unique path — same as SulgX style
+    ws_path = f"/ws/{user_uuid}"
 
+    params = {
+        "encryption": "none",
+        "security": "tls",
+        "type": "ws",
+        "path": ws_path,
+        "host": host_header,
+        "sni": sni,
+        "fp": fp,
+        "alpn": "http/1.1",
+    }
+    if fragment:
+        params["fragment"] = fragment
+
+    query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
     label = f"{flag} {user_name}".strip() if flag else user_name
-    query = "&".join(params)
-    return f"vless://{user_uuid}@{domain}:443?{query}#{label}"
+    return f"vless://{user_uuid}@{domain}:443?{query}#{quote(label)}"
 
 
 async def build_subscription(user_uuid: str) -> str:
@@ -348,6 +353,214 @@ app = FastAPI(title="XRay Panel", lifespan=lifespan)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ROUTES – PUBLIC
+# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# WEBSOCKET VLESS PROXY TUNNEL
+# ─────────────────────────────────────────────────────────────────────────────
+active_connections: dict = {}
+active_connections_lock = asyncio.Lock()
+
+
+async def pipe(reader, ws, user_uuid: str, direction: str):
+    """Pipe data between TCP stream and WebSocket."""
+    try:
+        while True:
+            data = await reader.read(65536)
+            if not data:
+                break
+            await ws.send_bytes(data)
+            # Track traffic
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    "UPDATE users SET used_traffic_bytes = used_traffic_bytes + ? WHERE uuid=?",
+                    (len(data), user_uuid)
+                )
+                await db.commit()
+    except Exception:
+        pass
+
+
+async def pipe_ws_to_tcp(ws: WebSocket, writer, user_uuid: str):
+    """Pipe data from WebSocket to TCP stream."""
+    try:
+        while True:
+            data = await ws.receive_bytes()
+            if not data:
+                break
+            writer.write(data)
+            await writer.drain()
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    "UPDATE users SET used_traffic_bytes = used_traffic_bytes + ? WHERE uuid=?",
+                    (len(data), user_uuid)
+                )
+                await db.commit()
+    except Exception:
+        pass
+
+
+@app.websocket("/ws/{user_uuid}")
+async def vless_ws_tunnel(websocket: WebSocket, user_uuid: str):
+    """
+    VLESS over WebSocket proxy endpoint.
+    Per-user path: /ws/{uuid}
+    Reads VLESS header, opens TCP to destination, bidirectional pipe.
+    """
+    # Validate user
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM users WHERE uuid=? AND is_active=1", (user_uuid,)
+        ) as cur:
+            user = await cur.fetchone()
+
+    if not user:
+        await websocket.close(code=1008)
+        return
+
+    # Check expiry
+    if user["expire_at"]:
+        exp = datetime.fromisoformat(user["expire_at"])
+        if datetime.now() > exp:
+            await websocket.close(code=1008)
+            return
+
+    # Check traffic limit
+    limit_bytes = user["traffic_limit_gb"] * 1024 ** 3
+    if limit_bytes > 0 and user["used_traffic_bytes"] >= limit_bytes:
+        await websocket.close(code=1008)
+        return
+
+    await websocket.accept()
+
+    conn_id = str(uuid.uuid4())
+    async with active_connections_lock:
+        active_connections[conn_id] = {
+            "uuid": user_uuid,
+            "name": user["name"],
+            "connected_at": datetime.now().isoformat(),
+        }
+
+    reader = None
+    writer = None
+
+    try:
+        # Read first chunk — contains VLESS header
+        first_data = await websocket.receive_bytes()
+        if not first_data or len(first_data) < 18:
+            await websocket.close(code=1003)
+            return
+
+        # ── Parse VLESS header ──────────────────────────────────────────────
+        # Byte 0:    version (must be 0)
+        # Bytes 1-16: UUID (16 bytes)
+        # Byte 17:   addons length (skip)
+        # Byte 18:   command (1=TCP, 2=UDP, 3=MUX)
+        # Byte 19-20: dest port (big-endian)
+        # Byte 21:   addr type (1=IPv4, 2=domain, 3=IPv6)
+        # ...then address, then payload
+
+        version = first_data[0]
+        if version != 0:
+            await websocket.close(code=1003)
+            return
+
+        offset = 17
+        addon_len = first_data[offset]
+        offset += 1 + addon_len  # skip addons
+
+        command = first_data[offset]
+        offset += 1
+
+        if command not in (1, 2):  # TCP or UDP only
+            await websocket.close(code=1003)
+            return
+
+        # Port
+        port = (first_data[offset] << 8) | first_data[offset + 1]
+        offset += 2
+
+        # Address type
+        addr_type = first_data[offset]
+        offset += 1
+
+        if addr_type == 1:  # IPv4
+            host = ".".join(str(b) for b in first_data[offset:offset + 4])
+            offset += 4
+        elif addr_type == 2:  # Domain
+            domain_len = first_data[offset]
+            offset += 1
+            host = first_data[offset:offset + domain_len].decode("utf-8", errors="replace")
+            offset += domain_len
+        elif addr_type == 3:  # IPv6
+            import socket as _socket
+            host = _socket.inet_ntop(_socket.AF_INET6, first_data[offset:offset + 16])
+            offset += 16
+        else:
+            await websocket.close(code=1003)
+            return
+
+        # Remaining bytes after header = first payload chunk
+        payload = first_data[offset:]
+
+        log.info(f"VLESS tunnel: {user['name']} → {host}:{port}")
+
+        # Open TCP connection to destination
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port),
+            timeout=10
+        )
+
+        # Send VLESS response header (version + addons length 0)
+        await websocket.send_bytes(bytes([0, 0]))
+
+        # Send first payload if any
+        if payload:
+            writer.write(payload)
+            await writer.drain()
+
+        # Bidirectional piping
+        await asyncio.gather(
+            pipe(reader, websocket, user_uuid, "down"),
+            pipe_ws_to_tcp(websocket, writer, user_uuid),
+            return_exceptions=True
+        )
+
+    except asyncio.TimeoutError:
+        log.warning(f"VLESS tunnel timeout for {user_uuid}")
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        log.warning(f"VLESS tunnel error for {user_uuid}: {e}")
+    finally:
+        if writer:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+        async with active_connections_lock:
+            active_connections.pop(conn_id, None)
+
+
+@app.websocket("/ws/{user_uuid}/{path:path}")
+async def vless_ws_tunnel_path(websocket: WebSocket, user_uuid: str, path: str):
+    """Support custom path per user."""
+    await vless_ws_tunnel(websocket, user_uuid)
+
+
+@app.get("/api/connections")
+async def get_connections(auth=Depends(require_auth)):
+    async with active_connections_lock:
+        return {"count": len(active_connections), "connections": list(active_connections.values())}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HEALTH
 # ─────────────────────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
