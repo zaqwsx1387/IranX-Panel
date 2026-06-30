@@ -266,7 +266,27 @@ async def build_subscription(user_uuid: str) -> str:
     if limit_bytes > 0 and user["used_traffic_bytes"] >= limit_bytes:
         return ""
 
-    # Get active clean IPs
+    # ── Calculate remaining traffic & days ───────────────────────────────────
+    lim_gb = float(user["traffic_limit_gb"] or 0)
+    used_b = int(user["used_traffic_bytes"] or 0)
+    lim_b  = lim_gb * 1024 ** 3
+    rem_b  = max(0, lim_b - used_b) if lim_b > 0 else 0
+    rem_gb = round(rem_b / 1024 ** 3, 2) if lim_b > 0 else 0
+    rem_txt = f"{rem_gb}GB" if lim_b > 0 else "∞"
+
+    days_left_txt = "∞"
+    if user["expire_at"]:
+        try:
+            diff = datetime.fromisoformat(user["expire_at"]) - datetime.now()
+            dl = max(0, diff.days)
+            days_left_txt = f"{dl}d"
+        except Exception:
+            pass
+
+    name = user["name"]
+    flag = user["flag"] or ""
+
+    # ── Get active clean IPs ──────────────────────────────────────────────────
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
@@ -275,32 +295,36 @@ async def build_subscription(user_uuid: str) -> str:
             ips = await cur.fetchall()
 
     links = []
+
+    # ── 1. Info-only "fake" config — always first in the list ─────────────────
+    # This is a dummy vless link whose only purpose is to show subscription
+    # info in the client's config name. It uses a loopback address so it
+    # never actually connects (clients show it as errored/offline, which
+    # is fine — the label is what matters).
+    info_label = f"📊 {flag} {name} | 💾 {rem_txt} left | ⏰ {days_left_txt}".strip()
+    # Use the real UUID but point at 127.0.0.1 so it never routes real traffic
+    from urllib.parse import quote as _quote
+    domain = DOMAIN
+    sni = await get_setting("sni", domain)
+    _ws_path = '/ws/' + user["uuid"]
+    info_params = (
+        "encryption=none&security=tls&type=ws"
+        f"&path={_quote(_ws_path)}"
+        f"&host={_quote(sni)}&sni={_quote(sni)}&fp=chrome&alpn=http%2F1.1"
+    )
+    info_link = f"vless://{user['uuid']}@127.0.0.1:443?{info_params}#{_quote(info_label)}"
+    links.append(info_link)
+
+    # ── 2. Real connection configs ────────────────────────────────────────────
     if ips:
-        # یه لینک برای هر IP تمیز — آدرس اتصال IP هست، SNI/host همون دامنه اصلی
         for ip_row in ips:
             ip_addr = ip_row["ip"]
             ip_label = ip_row["label"] or ip_addr
-            # Include remaining traffic in label (option C)
-            limit_bytes = float(user["traffic_limit_gb"] or 0) * 1024 ** 3
-            used_bytes = int(user["used_traffic_bytes"] or 0)
-            remaining_bytes = max(0, int(limit_bytes - used_bytes)) if limit_bytes > 0 else 0
-            remaining_gb = round(remaining_bytes / 1024 ** 3, 2) if limit_bytes > 0 else 0
-            remaining_txt = f"{remaining_gb}GB" if limit_bytes > 0 else "∞"
-            display_name = f"{user['flag']} {user['name']} | {remaining_txt} left | {ip_label}".strip()
-            link = await build_vless_link(
-                user["uuid"],
-                display_name,
-                address=ip_addr,
-            )
+            display_name = f"{flag} {name} | {rem_txt} | {ip_label}".strip()
+            link = await build_vless_link(user["uuid"], display_name, address=ip_addr)
             links.append(link)
     else:
-        # بدون IP تمیز — از دامنه اصلی استفاده کن (با نمایش حجم باقی‌مانده در لیبل)
-        limit_bytes = float(user["traffic_limit_gb"] or 0) * 1024 ** 3
-        used_bytes = int(user["used_traffic_bytes"] or 0)
-        remaining_bytes = max(0, int(limit_bytes - used_bytes)) if limit_bytes > 0 else 0
-        remaining_gb = round(remaining_bytes / 1024 ** 3, 2) if limit_bytes > 0 else 0
-        remaining_txt = f"{remaining_gb}GB" if limit_bytes > 0 else "∞"
-        display_name = f"{user['flag']} {user['name']} | {remaining_txt} left".strip()
+        display_name = f"{flag} {name} | {rem_txt}".strip()
         link = await build_vless_link(user["uuid"], display_name, "")
         links.append(link)
 
@@ -994,1618 +1018,1387 @@ async def panel(request: Request):
     return HTMLResponse(get_html(is_auth))
 
 
+
 def get_html(is_auth: bool) -> str:
     return f"""<!DOCTYPE html>
 <html lang="fa" dir="rtl">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>IranX-Panel</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>IranX Panel</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
-  :root {{
-    /* Minimal, pro palette (cool slate + electric cyan) */
-    --bg: #0b0f17;
-    --bg2: #0f1626;
-    --bg3: #111b30;
-    --card: rgba(255,255,255,0.04);
-    --card2: rgba(255,255,255,0.06);
-    --border: rgba(148,163,184,0.18);
-    --border2: rgba(148,163,184,0.28);
-    --accent: #22d3ee;
-    --accent2: #60a5fa;
-    --accent3: #a78bfa;
-    --green: #10b981;
-    --red: #fb7185;
-    --yellow: #fbbf24;
-    --blue: #60a5fa;
-    --text: rgba(248,250,252,0.92);
-    --text2: rgba(226,232,240,0.72);
-    --text3: rgba(148,163,184,0.65);
-    --shadow: 0 10px 40px rgba(0,0,0,0.45);
-    --radius: 16px;
-    --radius-sm: 12px;
-  }}
+:root {{
+  --bg:      #060b14;
+  --surface: #0d1524;
+  --surf2:   #111e33;
+  --surf3:   #162540;
+  --border:  rgba(99,179,237,0.12);
+  --bord2:   rgba(99,179,237,0.22);
+  --cyan:    #22d3ee;
+  --blue:    #3b82f6;
+  --violet:  #818cf8;
+  --green:   #10b981;
+  --red:     #f43f5e;
+  --amber:   #f59e0b;
+  --txt:     rgba(241,245,249,0.93);
+  --txt2:    rgba(148,163,184,0.80);
+  --txt3:    rgba(100,116,139,0.75);
+  --glow:    0 0 40px rgba(34,211,238,0.18);
+  --shadow:  0 12px 48px rgba(0,0,0,0.55);
+  --r:       16px;
+  --rsm:     10px;
+}}
+*,*::before,*::after{{box-sizing:border-box;margin:0;padding:0}}
+html{{height:100%}}
+body{{
+  font-family:'Vazirmatn',system-ui,sans-serif;
+  background:
+    radial-gradient(ellipse 900px 600px at 0% 0%,rgba(34,211,238,0.13) 0%,transparent 60%),
+    radial-gradient(ellipse 700px 500px at 100% 30%,rgba(59,130,246,0.11) 0%,transparent 60%),
+    radial-gradient(ellipse 600px 600px at 60% 100%,rgba(129,140,248,0.09) 0%,transparent 60%),
+    var(--bg);
+  color:var(--txt);
+  min-height:100vh;
+  direction:rtl;
+  overflow-x:hidden;
+}}
+::-webkit-scrollbar{{width:5px;height:5px}}
+::-webkit-scrollbar-track{{background:var(--surface)}}
+::-webkit-scrollbar-thumb{{background:var(--surf3);border-radius:10px}}
+::-webkit-scrollbar-thumb:hover{{background:var(--cyan)}}
 
-  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  
-  body {{
-    font-family: 'Vazirmatn', system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-    background: radial-gradient(1200px 900px at 15% 10%, rgba(34,211,238,0.12), transparent 55%),
-                radial-gradient(900px 700px at 85% 20%, rgba(96,165,250,0.10), transparent 55%),
-                radial-gradient(900px 700px at 40% 95%, rgba(167,139,250,0.08), transparent 55%),
-                var(--bg);
-    color: var(--text);
-    min-height: 100vh;
-    direction: rtl;
-  }}
+/* ── LAYOUT ─────────────────────────────────────────────── */
+.layout{{display:flex;min-height:100vh}}
 
-  /* SCROLLBAR */
-  ::-webkit-scrollbar {{ width: 6px; height: 6px; }}
-  ::-webkit-scrollbar-track {{ background: var(--bg2); }}
-  ::-webkit-scrollbar-thumb {{ background: var(--border); border-radius: 10px; }}
-  ::-webkit-scrollbar-thumb:hover {{ background: var(--accent); }}
+/* ── SIDEBAR ────────────────────────────────────────────── */
+.sidebar{{
+  width:248px;flex-shrink:0;
+  background:linear-gradient(180deg,var(--surface) 0%,rgba(13,21,36,0.97) 100%);
+  border-left:1px solid var(--border);
+  display:flex;flex-direction:column;
+  position:fixed;top:0;right:0;height:100vh;
+  z-index:200;transition:transform .3s cubic-bezier(.4,0,.2,1);
+  backdrop-filter:blur(20px);
+}}
+.sidebar-head{{
+  padding:22px 18px 18px;
+  border-bottom:1px solid var(--border);
+  display:flex;align-items:center;gap:12px;
+}}
+.logo-box{{
+  width:42px;height:42px;border-radius:12px;flex-shrink:0;
+  background:linear-gradient(135deg,var(--cyan),var(--blue));
+  display:flex;align-items:center;justify-content:center;
+  font-size:18px;box-shadow:var(--glow);
+}}
+.logo-text h2{{font-size:16px;font-weight:800;letter-spacing:-.3px}}
+.logo-text span{{font-size:11px;color:var(--txt3);font-weight:400}}
 
-  /* LOGIN PAGE */
-  .login-page {{
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    min-height: 100vh;
-    background: transparent;
-    position: relative;
-    overflow: hidden;
-  }}
-  .login-page::before {{
-    content: '';
-    position: absolute;
-    width: 600px; height: 600px;
-    background: radial-gradient(circle, rgba(34,211,238,0.16) 0%, transparent 70%);
-    top: -100px; right: -100px;
-    pointer-events: none;
-  }}
-  .login-page::after {{
-    content: '';
-    position: absolute;
-    width: 400px; height: 400px;
-    background: radial-gradient(circle, rgba(16,185,129,0.08) 0%, transparent 70%);
-    bottom: -50px; left: -50px;
-    pointer-events: none;
-  }}
-  .login-card {{
-    background: var(--card);
-    border: 1px solid var(--border);
-    border-radius: 20px;
-    padding: 48px 40px;
-    width: 420px;
-    max-width: 95vw;
-    box-shadow: var(--shadow);
-    position: relative;
-    z-index: 1;
-    animation: fadeIn 0.4s ease;
-  }}
-  .login-logo {{
-    text-align: center;
-    margin-bottom: 32px;
-  }}
-  .login-logo .icon {{
-    width: 72px; height: 72px;
-    background: linear-gradient(135deg, var(--accent), var(--green));
-    border-radius: 20px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 32px;
-    margin-bottom: 16px;
-    box-shadow: 0 10px 40px rgba(34,211,238,0.18);
-  }}
-  .login-logo h1 {{ font-size: 24px; font-weight: 700; color: var(--text); }}
-  .login-logo p {{ color: var(--text2); font-size: 14px; margin-top: 4px; }}
+.nav{{flex:1;padding:14px 10px;overflow-y:auto;display:flex;flex-direction:column;gap:2px}}
+.nav-lbl{{
+  font-size:10px;color:var(--txt3);font-weight:700;
+  letter-spacing:.08em;text-transform:uppercase;
+  padding:14px 10px 6px;
+}}
+.nav-item{{
+  display:flex;align-items:center;gap:10px;
+  padding:10px 14px;border-radius:var(--rsm);
+  font-size:13.5px;font-weight:500;color:var(--txt2);
+  cursor:pointer;transition:all .18s;
+  border:1px solid transparent;
+}}
+.nav-item:hover{{background:var(--surf2);color:var(--txt);}}
+.nav-item.active{{
+  background:rgba(34,211,238,0.11);
+  color:var(--cyan);
+  border-color:rgba(34,211,238,0.20);
+  font-weight:600;
+}}
+.nav-icon{{width:18px;text-align:center;font-size:14px;flex-shrink:0}}
 
-  /* FORM */
-  .form-group {{ margin-bottom: 20px; }}
-  .form-group label {{ display: block; font-size: 14px; color: var(--text2); margin-bottom: 8px; font-weight: 500; }}
-  .form-group input, .form-group select, .form-group textarea {{
-    width: 100%;
-    background: var(--bg2);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    color: var(--text);
-    padding: 12px 16px;
-    font-size: 14px;
-    font-family: inherit;
-    transition: border-color 0.2s, box-shadow 0.2s;
-    outline: none;
-    direction: ltr;
-    text-align: right;
-  }}
-  .form-group input:focus, .form-group select:focus, .form-group textarea:focus {{
-    border-color: var(--accent);
-    box-shadow: 0 0 0 3px rgba(34,211,238,0.16);
-  }}
-  .form-group textarea {{ resize: vertical; min-height: 80px; }}
-  .form-group select option {{ background: var(--bg2); }}
+.sidebar-foot{{
+  padding:12px 10px;border-top:1px solid var(--border);
+}}
+.user-row{{
+  display:flex;align-items:center;gap:10px;
+  padding:10px 12px;border-radius:var(--rsm);
+  background:var(--surf2);
+}}
+.user-ava{{
+  width:34px;height:34px;border-radius:50%;flex-shrink:0;
+  background:linear-gradient(135deg,var(--cyan),var(--violet));
+  display:flex;align-items:center;justify-content:center;
+  font-size:13px;font-weight:800;
+}}
+.user-name{{font-size:13px;font-weight:700}}
+.user-role{{font-size:11px;color:var(--txt3)}}
+.logout-btn{{
+  margin-right:auto;background:none;border:none;
+  color:var(--txt3);cursor:pointer;font-size:14px;
+  padding:4px;border-radius:6px;transition:color .18s;
+}}
+.logout-btn:hover{{color:var(--red)}}
 
-  /* BUTTONS */
-  .btn {{
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    padding: 10px 20px;
-    border-radius: var(--radius-sm);
-    font-size: 14px;
-    font-weight: 600;
-    cursor: pointer;
-    border: none;
-    transition: all 0.2s;
-    font-family: inherit;
-    text-decoration: none;
-  }}
-  .btn-primary {{
-    background: linear-gradient(135deg, var(--accent), var(--accent2));
-    color: rgba(3,7,18,0.92);
-    box-shadow: 0 10px 26px rgba(34,211,238,0.18);
-    border: 1px solid rgba(34,211,238,0.22);
-  }}
-  .btn-primary:hover {{ transform: translateY(-1px); box-shadow: 0 14px 34px rgba(34,211,238,0.22); }}
-  .btn-success {{ background: rgba(16,185,129,0.15); color: var(--green); border: 1px solid rgba(16,185,129,0.3); }}
-  .btn-success:hover {{ background: rgba(16,185,129,0.25); }}
-  .btn-danger {{ background: rgba(239,68,68,0.15); color: var(--red); border: 1px solid rgba(239,68,68,0.3); }}
-  .btn-danger:hover {{ background: rgba(239,68,68,0.25); }}
-  .btn-secondary {{ background: var(--bg3); color: var(--text2); border: 1px solid var(--border); }}
-  .btn-secondary:hover {{ background: var(--border); color: var(--text); }}
-  .btn-warning {{ background: rgba(245,158,11,0.15); color: var(--yellow); border: 1px solid rgba(245,158,11,0.3); }}
-  .btn-warning:hover {{ background: rgba(245,158,11,0.25); }}
-  .btn-full {{ width: 100%; justify-content: center; padding: 14px; font-size: 16px; }}
-  .btn-sm {{ padding: 6px 12px; font-size: 12px; border-radius: 6px; }}
-  .btn:disabled {{ opacity: 0.5; cursor: not-allowed; transform: none !important; }}
+/* ── MAIN ───────────────────────────────────────────────── */
+.main{{flex:1;margin-right:248px;display:flex;flex-direction:column;min-height:100vh}}
 
-  /* LAYOUT */
-  .app {{ display: flex; min-height: 100vh; }}
-  
-  /* SIDEBAR */
-  .sidebar {{
-    width: 260px;
-    background: var(--bg2);
-    border-left: 1px solid var(--border);
-    display: flex;
-    flex-direction: column;
-    position: fixed;
-    top: 0; right: 0;
-    height: 100vh;
-    z-index: 100;
-    transition: transform 0.3s;
-  }}
-  .sidebar-logo {{
-    padding: 24px 20px;
-    border-bottom: 1px solid var(--border);
-    display: flex;
-    align-items: center;
-    gap: 12px;
-  }}
-  .sidebar-logo .logo-icon {{
-    width: 44px; height: 44px;
-    background: linear-gradient(135deg, var(--accent), var(--green));
-    border-radius: 12px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 20px;
-    flex-shrink: 0;
-  }}
-  .sidebar-logo h2 {{ font-size: 18px; font-weight: 700; color: var(--text); }}
-  .sidebar-logo small {{ font-size: 11px; color: var(--text3); }}
-  
-  .sidebar-nav {{ flex: 1; padding: 16px 12px; overflow-y: auto; }}
-  .nav-section {{ margin-bottom: 24px; }}
-  .nav-section-title {{
-    font-size: 11px;
-    color: var(--text3);
-    font-weight: 600;
-    padding: 0 8px;
-    margin-bottom: 8px;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-  }}
-  .nav-item {{
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 10px 12px;
-    border-radius: var(--radius-sm);
-    color: var(--text2);
-    font-size: 14px;
-    font-weight: 500;
-    cursor: pointer;
-    transition: all 0.2s;
-    margin-bottom: 2px;
-    user-select: none;
-  }}
-  .nav-item:hover {{ background: var(--bg3); color: var(--text); }}
-  .nav-item.active {{ background: rgba(34,211,238,0.12); color: var(--accent); border: 1px solid rgba(34,211,238,0.18); }}
-  .nav-item .nav-icon {{ width: 20px; text-align: center; font-size: 15px; }}
-  
-  .sidebar-footer {{
-    padding: 16px 12px;
-    border-top: 1px solid var(--border);
-  }}
-  .user-info {{
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 10px 12px;
-    border-radius: var(--radius-sm);
-    background: var(--bg3);
-  }}
-  .user-avatar {{
-    width: 36px; height: 36px;
-    background: linear-gradient(135deg, var(--accent), var(--green));
-    border-radius: 50%;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 14px;
-    font-weight: 700;
-  }}
-  .user-name {{ font-size: 14px; font-weight: 600; }}
-  .user-role {{ font-size: 12px; color: var(--text3); }}
-  
-  /* MAIN CONTENT */
-  .main {{
-    flex: 1;
-    margin-right: 260px;
-    display: flex;
-    flex-direction: column;
-    min-height: 100vh;
-  }}
-  
-  /* TOPBAR */
-  .topbar {{
-    background: var(--bg2);
-    border-bottom: 1px solid var(--border);
-    padding: 16px 28px;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    position: sticky;
-    top: 0;
-    z-index: 50;
-  }}
-  .topbar-title {{
-    font-size: 20px;
-    font-weight: 700;
-    color: var(--text);
-  }}
-  .topbar-subtitle {{
-    font-size: 13px;
-    color: var(--text2);
-    margin-top: 2px;
-  }}
-  .topbar-actions {{ display: flex; gap: 10px; align-items: center; }}
-  
-  /* CONTENT */
-  .content {{ padding: 28px; flex: 1; }}
-  
-  /* CARDS */
-  .card {{
-    background: var(--card);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 24px;
-    margin-bottom: 24px;
-  }}
-  .card-title {{
-    font-size: 16px;
-    font-weight: 700;
-    color: var(--text);
-    margin-bottom: 20px;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }}
-  
-  /* STAT CARDS */
-  .stats-grid {{
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-    gap: 16px;
-    margin-bottom: 24px;
-  }}
-  .stat-card {{
-    background: var(--card);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 20px;
-    position: relative;
-    overflow: hidden;
-    transition: transform 0.2s, box-shadow 0.2s;
-  }}
-  .stat-card:hover {{ transform: translateY(-2px); box-shadow: var(--shadow); }}
-  .stat-card::before {{
-    content: '';
-    position: absolute;
-    top: 0; left: 0; right: 0;
-    height: 3px;
-  }}
-  .stat-card.accent::before {{ background: linear-gradient(90deg, var(--accent), var(--accent2)); }}
-  .stat-card.green::before {{ background: linear-gradient(90deg, var(--green), #34d399); }}
-  .stat-card.red::before {{ background: linear-gradient(90deg, var(--red), #f87171); }}
-  .stat-card.yellow::before {{ background: linear-gradient(90deg, var(--yellow), #fbbf24); }}
-  .stat-card.blue::before {{ background: linear-gradient(90deg, var(--blue), #60a5fa); }}
-  
-  .stat-icon {{
-    width: 48px; height: 48px;
-    border-radius: 12px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 22px;
-    margin-bottom: 16px;
-  }}
-  .stat-icon.accent {{ background: rgba(34,211,238,0.14); color: var(--accent); }}
-  .stat-icon.green {{ background: rgba(16,185,129,0.14); color: var(--green); }}
-  .stat-icon.red {{ background: rgba(251,113,133,0.14); color: var(--red); }}
-  .stat-icon.yellow {{ background: rgba(251,191,36,0.14); color: var(--yellow); }}
-  .stat-icon.blue {{ background: rgba(96,165,250,0.14); color: var(--blue); }}
-  
-  .stat-value {{ font-size: 32px; font-weight: 800; color: var(--text); line-height: 1; }}
-  .stat-label {{ font-size: 13px; color: var(--text2); margin-top: 6px; font-weight: 500; }}
-  .stat-sub {{ font-size: 12px; color: var(--text3); margin-top: 4px; }}
-  
-  /* TABLE */
-  .table-wrapper {{ overflow-x: auto; }}
-  table {{ width: 100%; border-collapse: collapse; direction: rtl; }}
-  th {{
-    background: var(--bg3);
-    color: var(--text2);
-    font-size: 12px;
-    font-weight: 600;
-    padding: 12px 16px;
-    text-align: right;
-    white-space: nowrap;
-    border-bottom: 1px solid var(--border);
-  }}
-  td {{
-    padding: 14px 16px;
-    color: var(--text);
-    font-size: 13px;
-    border-bottom: 1px solid rgba(42,53,85,0.5);
-    vertical-align: middle;
-  }}
-  tr:last-child td {{ border-bottom: none; }}
-  tr:hover td {{ background: rgba(255,255,255,0.02); }}
-  
-  /* BADGES */
-  .badge {{
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    padding: 3px 10px;
-    border-radius: 100px;
-    font-size: 12px;
-    font-weight: 600;
-    white-space: nowrap;
-  }}
-  .badge-green {{ background: rgba(16,185,129,0.15); color: var(--green); }}
-  .badge-red {{ background: rgba(239,68,68,0.15); color: var(--red); }}
-  .badge-yellow {{ background: rgba(245,158,11,0.15); color: var(--yellow); }}
-  .badge-blue {{ background: rgba(96,165,250,0.14); color: var(--blue); }}
-  .badge-purple {{ background: rgba(167,139,250,0.14); color: var(--accent3); }}
-  
-  /* PROGRESS */
-  .progress {{
-    height: 6px;
-    background: var(--bg3);
-    border-radius: 100px;
-    overflow: hidden;
-    margin-top: 6px;
-  }}
-  .progress-bar {{
-    height: 100%;
-    border-radius: 100px;
-    transition: width 0.5s;
-  }}
-  .progress-bar.green {{ background: linear-gradient(90deg, var(--green), #34d399); }}
-  .progress-bar.yellow {{ background: linear-gradient(90deg, var(--yellow), #fbbf24); }}
-  .progress-bar.red {{ background: linear-gradient(90deg, var(--red), #f87171); }}
-  
-  /* MODAL */
-  .modal-overlay {{
-    position: fixed;
-    inset: 0;
-    background: rgba(0,0,0,0.7);
-    backdrop-filter: blur(4px);
-    z-index: 1000;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 20px;
-    animation: fadeIn 0.2s;
-  }}
-  .modal {{
-    background: var(--card);
-    border: 1px solid var(--border);
-    border-radius: 20px;
-    width: 100%;
-    max-width: 560px;
-    max-height: 90vh;
-    overflow-y: auto;
-    box-shadow: 0 20px 60px rgba(0,0,0,0.5);
-    animation: slideUp 0.3s ease;
-  }}
-  .modal-header {{
-    padding: 24px 28px;
-    border-bottom: 1px solid var(--border);
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-  }}
-  .modal-title {{ font-size: 18px; font-weight: 700; color: var(--text); }}
-  .modal-close {{
-    width: 32px; height: 32px;
-    background: var(--bg3);
-    border: none;
-    border-radius: 8px;
-    color: var(--text2);
-    cursor: pointer;
-    font-size: 16px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    transition: all 0.2s;
-  }}
-  .modal-close:hover {{ background: var(--red); color: white; }}
-  .modal-body {{ padding: 24px 28px; }}
-  .modal-footer {{ padding: 16px 28px 24px; display: flex; gap: 10px; justify-content: flex-end; }}
-  
-  /* TOAST */
-  .toast-container {{
-    position: fixed;
-    bottom: 24px;
-    left: 24px;
-    z-index: 9999;
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-  }}
-  .toast {{
-    background: var(--bg3);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 14px 18px;
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    min-width: 280px;
-    box-shadow: var(--shadow);
-    animation: slideInLeft 0.3s ease;
-    font-size: 14px;
-  }}
-  .toast.success {{ border-color: rgba(16,185,129,0.3); }}
-  .toast.error {{ border-color: rgba(239,68,68,0.3); }}
-  .toast-icon.success {{ color: var(--green); }}
-  .toast-icon.error {{ color: var(--red); }}
-  
-  /* SEARCH */
-  .search-bar {{
-    position: relative;
-    flex: 1;
-    max-width: 340px;
-  }}
-  .search-bar input {{
-    width: 100%;
-    background: var(--bg3);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    color: var(--text);
-    padding: 10px 16px 10px 40px;
-    font-size: 14px;
-    font-family: inherit;
-    outline: none;
-    direction: rtl;
-    transition: border-color 0.2s;
-  }}
-  .search-bar input:focus {{ border-color: var(--accent); }}
-  .search-bar .search-icon {{
-    position: absolute;
-    left: 12px;
-    top: 50%;
-    transform: translateY(-50%);
-    color: var(--text3);
-  }}
-  
-  /* SYSTEM HEALTH */
-  .health-grid {{
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 16px;
-  }}
-  .health-item {{ text-align: center; }}
-  .health-circle {{
-    width: 80px; height: 80px;
-    border-radius: 50%;
-    background: conic-gradient(var(--accent) 0%, var(--bg3) 0%);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    margin: 0 auto 8px;
-    font-size: 16px;
-    font-weight: 700;
-    position: relative;
-  }}
-  .health-circle::before {{
-    content: '';
-    position: absolute;
-    inset: 6px;
-    border-radius: 50%;
-    background: var(--card);
-  }}
-  .health-circle span {{ position: relative; z-index: 1; font-size: 14px; }}
-  .health-label {{ font-size: 12px; color: var(--text2); font-weight: 500; }}
-  
-  /* CHART CONTAINER */
-  .chart-container {{ position: relative; height: 220px; }}
-  
-  /* TWO-COL GRID */
-  .grid-2 {{ display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }}
-  .grid-3 {{ display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; }}
-  
-  /* COPY BTN */
-  .copy-btn {{
-    background: none;
-    border: none;
-    color: var(--text3);
-    cursor: pointer;
-    padding: 4px;
-    border-radius: 4px;
-    transition: color 0.2s;
-    font-size: 13px;
-  }}
-  .copy-btn:hover {{ color: var(--accent); }}
-  
-  /* CODE BLOCK */
-  .code-block {{
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 12px 16px;
-    font-family: monospace;
-    font-size: 13px;
-    color: var(--accent3);
-    word-break: break-all;
-    display: flex;
-    align-items: flex-start;
-    gap: 10px;
-    direction: ltr;
-  }}
-  .code-block .code-text {{ flex: 1; }}
-  
-  /* SECTION TABS */
-  .page {{ display: none; }}
-  .page.active {{ display: block; }}
-  
-  /* TOGGLE */
-  .toggle {{
-    position: relative;
-    width: 44px;
-    height: 24px;
-    display: inline-block;
-  }}
-  .toggle input {{ opacity: 0; width: 0; height: 0; }}
-  .toggle-slider {{
-    position: absolute;
-    inset: 0;
-    background: var(--bg3);
-    border-radius: 100px;
-    cursor: pointer;
-    transition: 0.3s;
-    border: 1px solid var(--border);
-  }}
-  .toggle-slider::before {{
-    content: '';
-    position: absolute;
-    width: 18px; height: 18px;
-    border-radius: 50%;
-    background: var(--text3);
-    top: 2px; right: 2px;
-    transition: 0.3s;
-  }}
-  .toggle input:checked + .toggle-slider {{ background: rgba(99,102,241,0.3); border-color: var(--accent); }}
-  .toggle input:checked + .toggle-slider::before {{ background: var(--accent); transform: translateX(-20px); }}
+/* ── TOPBAR ─────────────────────────────────────────────── */
+.topbar{{
+  background:rgba(13,21,36,0.85);backdrop-filter:blur(20px);
+  border-bottom:1px solid var(--border);
+  padding:0 28px;height:60px;
+  display:flex;align-items:center;justify-content:space-between;
+  position:sticky;top:0;z-index:100;
+}}
+.topbar-left{{display:flex;align-items:center;gap:12px}}
+.burger{{
+  display:none;background:none;border:none;
+  color:var(--txt2);font-size:18px;cursor:pointer;padding:4px;
+}}
+.page-title{{font-size:17px;font-weight:700;letter-spacing:-.3px}}
+.page-sub{{font-size:12px;color:var(--txt3);margin-top:1px}}
+.topbar-right{{display:flex;gap:8px;align-items:center}}
 
-  /* CHIP */
-  .chip-input-wrapper {{ display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }}
-  .chip {{
-    background: rgba(99,102,241,0.15);
-    color: var(--accent2);
-    border-radius: 6px;
-    padding: 3px 10px;
-    font-size: 12px;
-    font-family: monospace;
-    display: flex;
-    align-items: center;
-    gap: 4px;
-  }}
-  .chip-remove {{ cursor: pointer; color: var(--text3); font-size: 11px; }}
-  .chip-remove:hover {{ color: var(--red); }}
+/* ── CONTENT ────────────────────────────────────────────── */
+.content{{padding:24px 28px;flex:1}}
 
-  /* EMPTY STATE */
-  .empty-state {{
-    text-align: center;
-    padding: 60px 20px;
-    color: var(--text3);
-  }}
-  .empty-state .empty-icon {{ font-size: 48px; margin-bottom: 16px; opacity: 0.5; }}
-  .empty-state h3 {{ font-size: 18px; color: var(--text2); margin-bottom: 8px; }}
-  .empty-state p {{ font-size: 14px; }}
+/* ── CARDS ──────────────────────────────────────────────── */
+.card{{
+  background:rgba(255,255,255,0.028);
+  border:1px solid var(--border);
+  border-radius:var(--r);
+  padding:22px;
+  position:relative;overflow:hidden;
+}}
+.card::before{{
+  content:'';position:absolute;top:0;left:0;right:0;height:1px;
+  background:linear-gradient(90deg,transparent,rgba(34,211,238,0.3),transparent);
+}}
+.card-title{{
+  font-size:14px;font-weight:700;color:var(--txt);
+  margin-bottom:18px;display:flex;align-items:center;gap:8px;
+}}
+.card-title .ct-icon{{
+  width:28px;height:28px;border-radius:8px;
+  display:flex;align-items:center;justify-content:center;
+  font-size:13px;background:rgba(34,211,238,0.14);color:var(--cyan);
+}}
 
-  /* ANIMATIONS */
-  @keyframes fadeIn {{ from {{ opacity: 0; }} to {{ opacity: 1; }} }}
-  @keyframes slideUp {{ from {{ opacity: 0; transform: translateY(20px); }} to {{ opacity: 1; transform: translateY(0); }} }}
-  @keyframes slideInLeft {{ from {{ opacity: 0; transform: translateX(-20px); }} to {{ opacity: 1; transform: translateX(0); }} }}
-  @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
-  .spin {{ animation: spin 1s linear infinite; }}
-  
-  /* RESPONSIVE */
-  @media (max-width: 768px) {{
-    .sidebar {{ transform: translateX(100%); }}
-    .sidebar.open {{ transform: translateX(0); }}
-    .main {{ margin-right: 0; }}
-    .grid-2 {{ grid-template-columns: 1fr; }}
-    .health-grid {{ grid-template-columns: 1fr; }}
-    .content {{ padding: 16px; }}
-    .topbar {{ padding: 12px 16px; }}
-    .stats-grid {{ grid-template-columns: repeat(2, 1fr); }}
-  }}
-  
-  .mobile-menu-btn {{
-    display: none;
-    background: none;
-    border: none;
-    color: var(--text);
-    font-size: 20px;
-    cursor: pointer;
-    padding: 4px;
-  }}
-  @media (max-width: 768px) {{ .mobile-menu-btn {{ display: flex; }} }}
-  
-  .sidebar-overlay {{
-    display: none;
-    position: fixed;
-    inset: 0;
-    background: rgba(0,0,0,0.5);
-    z-index: 99;
-  }}
-  .sidebar-overlay.active {{ display: block; }}
-  
-  /* FLAG EMOJI */
-  .flag {{ font-style: normal; margin-left: 4px; }}
-  
-  /* IP TABLE */
-  .ip-chip {{
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 3px 10px;
-    font-family: monospace;
-    font-size: 12px;
-    color: var(--accent3);
-  }}
+/* ── STAT GRID ──────────────────────────────────────────── */
+.stats-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:14px;margin-bottom:20px}}
+.stat{{
+  background:rgba(255,255,255,0.030);border:1px solid var(--border);
+  border-radius:var(--r);padding:18px;
+  position:relative;overflow:hidden;
+  transition:transform .2s,box-shadow .2s;cursor:default;
+}}
+.stat:hover{{transform:translateY(-2px);box-shadow:var(--shadow)}}
+.stat-stripe{{
+  position:absolute;top:0;left:0;right:0;height:2px;
+  border-radius:var(--r) var(--r) 0 0;
+}}
+.stat-ico{{
+  width:44px;height:44px;border-radius:12px;
+  display:flex;align-items:center;justify-content:center;
+  font-size:20px;margin-bottom:14px;
+}}
+.stat-val{{font-size:30px;font-weight:800;line-height:1;letter-spacing:-.5px}}
+.stat-lbl{{font-size:12px;color:var(--txt2);margin-top:5px;font-weight:500}}
+.stat-hint{{font-size:11px;color:var(--txt3);margin-top:3px}}
+
+/* cyan */
+.s-cyan .stat-stripe{{background:linear-gradient(90deg,var(--cyan),var(--blue))}}
+.s-cyan .stat-ico{{background:rgba(34,211,238,0.13);color:var(--cyan)}}
+.s-cyan .stat-val{{color:var(--cyan)}}
+/* green */
+.s-green .stat-stripe{{background:linear-gradient(90deg,var(--green),#34d399)}}
+.s-green .stat-ico{{background:rgba(16,185,129,0.13);color:var(--green)}}
+.s-green .stat-val{{color:var(--green)}}
+/* red */
+.s-red .stat-stripe{{background:linear-gradient(90deg,var(--red),#fb7185)}}
+.s-red .stat-ico{{background:rgba(244,63,94,0.13);color:var(--red)}}
+.s-red .stat-val{{color:var(--red)}}
+/* amber */
+.s-amber .stat-stripe{{background:linear-gradient(90deg,var(--amber),#fbbf24)}}
+.s-amber .stat-ico{{background:rgba(245,158,11,0.13);color:var(--amber)}}
+.s-amber .stat-val{{color:var(--amber)}}
+/* blue */
+.s-blue .stat-stripe{{background:linear-gradient(90deg,var(--blue),var(--violet))}}
+.s-blue .stat-ico{{background:rgba(59,130,246,0.13);color:var(--blue)}}
+.s-blue .stat-val{{color:var(--blue)}}
+
+/* ── GAUGE ──────────────────────────────────────────────── */
+.gauges{{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}}
+.gauge-wrap{{text-align:center}}
+.gauge-svg{{transform:rotate(-90deg)}}
+.gauge-bg{{fill:none;stroke:var(--surf3);stroke-width:8}}
+.gauge-fg{{fill:none;stroke-width:8;stroke-linecap:round;transition:stroke-dashoffset .8s}}
+.gauge-val{{font-size:15px;font-weight:800;dominant-baseline:middle;text-anchor:middle;transform:rotate(90deg)}}
+.gauge-lbl{{font-size:11px;color:var(--txt2);margin-top:6px;font-weight:500}}
+
+/* ── TABLE ──────────────────────────────────────────────── */
+.tbl-wrap{{overflow-x:auto;border-radius:var(--rsm)}}
+table{{width:100%;border-collapse:collapse;direction:rtl;white-space:nowrap}}
+thead th{{
+  background:var(--surf2);color:var(--txt3);font-size:11px;
+  font-weight:700;padding:11px 14px;text-align:right;
+  border-bottom:1px solid var(--border);letter-spacing:.04em;text-transform:uppercase;
+}}
+tbody td{{
+  padding:13px 14px;font-size:13px;color:var(--txt);
+  border-bottom:1px solid rgba(99,179,237,0.06);vertical-align:middle;
+}}
+tbody tr:last-child td{{border-bottom:none}}
+tbody tr:hover td{{background:rgba(255,255,255,0.018)}}
+
+/* ── BADGE ──────────────────────────────────────────────── */
+.badge{{
+  display:inline-flex;align-items:center;gap:4px;
+  padding:3px 9px;border-radius:100px;
+  font-size:11px;font-weight:700;white-space:nowrap;
+}}
+.bg{{background:rgba(16,185,129,0.14);color:var(--green)}}
+.br{{background:rgba(244,63,94,0.14);color:var(--red)}}
+.by{{background:rgba(245,158,11,0.14);color:var(--amber)}}
+.bb{{background:rgba(59,130,246,0.14);color:var(--blue)}}
+.bv{{background:rgba(129,140,248,0.14);color:var(--violet)}}
+
+/* ── PROGRESS ───────────────────────────────────────────── */
+.prog{{height:5px;background:var(--surf3);border-radius:100px;overflow:hidden;margin-top:5px;min-width:80px}}
+.prog-bar{{height:100%;border-radius:100px;transition:width .6s}}
+.prog-g{{background:linear-gradient(90deg,var(--green),#34d399)}}
+.prog-y{{background:linear-gradient(90deg,var(--amber),#fbbf24)}}
+.prog-r{{background:linear-gradient(90deg,var(--red),#fb7185)}}
+
+/* ── BUTTONS ────────────────────────────────────────────── */
+.btn{{
+  display:inline-flex;align-items:center;gap:7px;
+  padding:9px 18px;border-radius:var(--rsm);
+  font-size:13px;font-weight:600;cursor:pointer;border:none;
+  font-family:inherit;transition:all .18s;text-decoration:none;
+  white-space:nowrap;
+}}
+.btn-primary{{
+  background:linear-gradient(135deg,var(--cyan),var(--blue));
+  color:rgba(6,11,20,0.95);
+  box-shadow:0 6px 20px rgba(34,211,238,0.22);
+}}
+.btn-primary:hover{{transform:translateY(-1px);box-shadow:0 10px 28px rgba(34,211,238,0.28)}}
+.btn-sm{{padding:6px 12px;font-size:12px;border-radius:8px}}
+.btn-success{{background:rgba(16,185,129,0.14);color:var(--green);border:1px solid rgba(16,185,129,0.28)}}
+.btn-success:hover{{background:rgba(16,185,129,0.24)}}
+.btn-danger{{background:rgba(244,63,94,0.12);color:var(--red);border:1px solid rgba(244,63,94,0.25)}}
+.btn-danger:hover{{background:rgba(244,63,94,0.22)}}
+.btn-ghost{{background:var(--surf2);color:var(--txt2);border:1px solid var(--border)}}
+.btn-ghost:hover{{background:var(--surf3);color:var(--txt)}}
+.btn-amber{{background:rgba(245,158,11,0.13);color:var(--amber);border:1px solid rgba(245,158,11,0.25)}}
+.btn-amber:hover{{background:rgba(245,158,11,0.22)}}
+.btn-full{{width:100%;justify-content:center;padding:13px;font-size:14px}}
+.btn:disabled{{opacity:.45;cursor:not-allowed;transform:none!important;box-shadow:none!important}}
+
+/* ── FORM ───────────────────────────────────────────────── */
+.form-row{{display:grid;grid-template-columns:1fr 1fr;gap:14px}}
+.fg{{margin-bottom:16px}}
+.fg label{{display:block;font-size:12px;color:var(--txt2);margin-bottom:7px;font-weight:600;letter-spacing:.02em}}
+.fg input,.fg select,.fg textarea{{
+  width:100%;background:var(--surf2);border:1px solid var(--border);
+  border-radius:var(--rsm);color:var(--txt);
+  padding:10px 14px;font-size:13px;font-family:inherit;
+  outline:none;transition:border-color .18s,box-shadow .18s;
+  direction:ltr;text-align:right;
+}}
+.fg input:focus,.fg select:focus,.fg textarea:focus{{
+  border-color:var(--cyan);box-shadow:0 0 0 3px rgba(34,211,238,0.14);
+}}
+.fg textarea{{resize:vertical;min-height:80px}}
+.fg select option{{background:var(--surf2)}}
+
+/* ── MODAL ──────────────────────────────────────────────── */
+.overlay{{
+  position:fixed;inset:0;
+  background:rgba(6,11,20,0.75);backdrop-filter:blur(6px);
+  z-index:1000;display:flex;align-items:center;justify-content:center;
+  padding:16px;animation:fadeIn .18s;
+}}
+.modal{{
+  background:var(--surface);border:1px solid var(--bord2);
+  border-radius:20px;width:100%;max-width:560px;max-height:92vh;
+  overflow-y:auto;box-shadow:var(--shadow);
+  animation:slideUp .25s cubic-bezier(.4,0,.2,1);
+}}
+.modal-lg{{max-width:680px}}
+.m-head{{
+  padding:22px 24px;border-bottom:1px solid var(--border);
+  display:flex;align-items:center;justify-content:space-between;
+}}
+.m-title{{font-size:17px;font-weight:800}}
+.m-close{{
+  width:30px;height:30px;background:var(--surf2);border:none;
+  border-radius:8px;color:var(--txt2);cursor:pointer;font-size:15px;
+  display:flex;align-items:center;justify-content:center;transition:all .18s;
+}}
+.m-close:hover{{background:var(--red);color:#fff}}
+.m-body{{padding:22px 24px}}
+.m-foot{{padding:14px 24px 22px;display:flex;gap:10px;justify-content:flex-end}}
+
+/* ── TOAST ──────────────────────────────────────────────── */
+.toast-wrap{{
+  position:fixed;bottom:20px;left:20px;z-index:9999;
+  display:flex;flex-direction:column;gap:8px;pointer-events:none;
+}}
+.toast{{
+  background:var(--surf2);border:1px solid var(--border);
+  border-radius:12px;padding:12px 16px;
+  display:flex;align-items:center;gap:10px;
+  min-width:260px;max-width:360px;
+  box-shadow:var(--shadow);
+  animation:slideInLeft .25s;font-size:13px;pointer-events:all;
+}}
+.toast.ok{{border-color:rgba(16,185,129,0.35)}}
+.toast.err{{border-color:rgba(244,63,94,0.35)}}
+.t-ico.ok{{color:var(--green)}}
+.t-ico.err{{color:var(--red)}}
+
+/* ── COPY BOX ───────────────────────────────────────────── */
+.copy-box{{
+  background:var(--bg);border:1px solid var(--border);
+  border-radius:var(--rsm);padding:11px 14px;
+  font-family:monospace;font-size:12.5px;color:var(--cyan);
+  word-break:break-all;direction:ltr;text-align:left;
+  display:flex;align-items:flex-start;gap:8px;margin-bottom:10px;
+}}
+.copy-box .cb-txt{{flex:1;line-height:1.5}}
+.copy-btn{{
+  background:none;border:none;color:var(--txt3);
+  cursor:pointer;padding:2px 4px;border-radius:4px;
+  font-size:13px;transition:color .18s;flex-shrink:0;
+}}
+.copy-btn:hover{{color:var(--cyan)}}
+
+/* ── SECTION PAGES ──────────────────────────────────────── */
+.page{{display:none}}.page.active{{display:block;animation:fadeIn .2s}}
+
+/* ── TOGGLE ─────────────────────────────────────────────── */
+.tog{{position:relative;width:42px;height:22px;display:inline-block;flex-shrink:0}}
+.tog input{{opacity:0;width:0;height:0}}
+.tog-sl{{
+  position:absolute;inset:0;background:var(--surf3);
+  border-radius:100px;cursor:pointer;transition:.25s;
+  border:1px solid var(--border);
+}}
+.tog-sl::before{{
+  content:'';position:absolute;
+  width:16px;height:16px;border-radius:50%;
+  background:var(--txt3);top:2px;right:2px;transition:.25s;
+}}
+.tog input:checked+.tog-sl{{background:rgba(34,211,238,0.25);border-color:var(--cyan)}}
+.tog input:checked+.tog-sl::before{{background:var(--cyan);transform:translateX(-20px)}}
+
+/* ── IP CHIP ────────────────────────────────────────────── */
+.ip-chip{{
+  background:var(--surf2);border:1px solid var(--border);
+  border-radius:6px;padding:3px 9px;
+  font-family:monospace;font-size:12px;color:var(--cyan);display:inline-block;
+}}
+
+/* ── SEARCH ─────────────────────────────────────────────── */
+.search{{position:relative;flex:1;max-width:300px}}
+.search input{{
+  width:100%;background:var(--surf2);border:1px solid var(--border);
+  border-radius:var(--rsm);color:var(--txt);
+  padding:9px 14px 9px 36px;font-size:13px;
+  font-family:inherit;outline:none;direction:rtl;transition:border-color .18s;
+}}
+.search input:focus{{border-color:var(--cyan)}}
+.search-ico{{position:absolute;left:11px;top:50%;transform:translateY(-50%);color:var(--txt3);font-size:13px}}
+
+/* ── EMPTY STATE ────────────────────────────────────────── */
+.empty{{text-align:center;padding:56px 20px;color:var(--txt3)}}
+.empty-ico{{font-size:44px;margin-bottom:14px;opacity:.45}}
+.empty h3{{font-size:17px;color:var(--txt2);margin-bottom:6px}}
+.empty p{{font-size:13px}}
+
+/* ── LOGIN ──────────────────────────────────────────────── */
+.login-scene{{
+  min-height:100vh;display:flex;align-items:center;
+  justify-content:center;padding:20px;
+}}
+.login-box{{
+  background:rgba(13,21,36,0.90);border:1px solid var(--bord2);
+  border-radius:24px;padding:44px 40px;width:100%;max-width:420px;
+  box-shadow:var(--shadow);backdrop-filter:blur(12px);
+  animation:fadeIn .35s;
+}}
+.login-logo{{text-align:center;margin-bottom:32px}}
+.login-ico{{
+  width:68px;height:68px;border-radius:18px;margin:0 auto 16px;
+  background:linear-gradient(135deg,var(--cyan),var(--blue));
+  display:flex;align-items:center;justify-content:center;
+  font-size:30px;box-shadow:0 12px 36px rgba(34,211,238,0.25);
+}}
+.login-logo h1{{font-size:22px;font-weight:800;letter-spacing:-.5px}}
+.login-logo p{{color:var(--txt3);font-size:13px;margin-top:4px}}
+
+/* ── INFO CARDS (sub link modal) ──────────────────────── */
+.info-band{{
+  display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:16px;
+}}
+.info-cell{{
+  background:var(--surf2);border:1px solid var(--border);
+  border-radius:10px;padding:12px;text-align:center;
+}}
+.info-cell .iv{{font-size:18px;font-weight:800;color:var(--cyan)}}
+.info-cell .il{{font-size:11px;color:var(--txt3);margin-top:3px}}
+
+/* ── ANIMATIONS ─────────────────────────────────────────── */
+@keyframes fadeIn{{from{{opacity:0}}to{{opacity:1}}}}
+@keyframes slideUp{{from{{opacity:0;transform:translateY(18px)}}to{{opacity:1;transform:translateY(0)}}}}
+@keyframes slideInLeft{{from{{opacity:0;transform:translateX(-16px)}}to{{opacity:1;transform:translateX(0)}}}}
+@keyframes spin{{to{{transform:rotate(360deg)}}}}
+.spin{{animation:spin 1s linear infinite}}
+
+/* ── MOBILE ─────────────────────────────────────────────── */
+@media(max-width:768px){{
+  .sidebar{{transform:translateX(110%);box-shadow:var(--shadow)}}
+  .sidebar.open{{transform:translateX(0)}}
+  .overlay-backdrop{{display:block}}
+  .main{{margin-right:0}}
+  .burger{{display:flex}}
+  .content{{padding:14px 14px 24px}}
+  .topbar{{padding:0 14px}}
+  .stats-grid{{grid-template-columns:1fr 1fr}}
+  .form-row{{grid-template-columns:1fr}}
+  .gauges{{grid-template-columns:1fr 1fr}}
+  .m-body{{padding:16px}}
+  .m-foot{{padding:12px 16px 20px}}
+  .info-band{{grid-template-columns:1fr 1fr}}
+}}
+@media(max-width:420px){{
+  .stats-grid{{grid-template-columns:1fr}}
+  .login-box{{padding:32px 22px}}
+  .info-band{{grid-template-columns:1fr}}
+}}
+
+/* ── MOBILE BACKDROP ────────────────────────────────────── */
+.overlay-backdrop{{
+  display:none;position:fixed;inset:0;
+  background:rgba(6,11,20,0.65);z-index:199;
+}}
+.overlay-backdrop.show{{display:block}}
 </style>
 </head>
 <body>
 
-{"" if is_auth else '<div id="login-wrapper"></div>'}
-{"" if not is_auth else '<div id="app-wrapper"></div>'}
-
-<div class="toast-container" id="toast-container"></div>
+{'<div id="login-root"></div>' if not is_auth else '<div id="app-root"></div>'}
+<div class="toast-wrap" id="toasts"></div>
 
 <script>
 const IS_AUTH = {'true' if is_auth else 'false'};
+const VER = '{PANEL_VERSION}';
 
-// ─── UTILITIES ────────────────────────────────────────────────────────────────
-function toast(msg, type='success') {{
-  const c = document.getElementById('toast-container');
-  const t = document.createElement('div');
-  t.className = `toast ${{type}}`;
-  t.innerHTML = `<span class="toast-icon ${{type}}"><i class="fa ${{type==='success'?'fa-check-circle':'fa-exclamation-circle'}}"></i></span><span>${{msg}}</span>`;
-  c.appendChild(t);
-  setTimeout(() => t.remove(), 3500);
+// ══════════════════════════════════════════════════════
+//  UTILS
+// ══════════════════════════════════════════════════════
+function toast(msg, type='ok'){{
+  const w = document.getElementById('toasts');
+  const d = document.createElement('div');
+  d.className = `toast ${{type}}`;
+  d.innerHTML = `<i class="fa ${{type==='ok'?'fa-check-circle':'fa-times-circle'}} t-ico ${{type}}"></i><span>${{msg}}</span>`;
+  w.append(d);
+  setTimeout(()=>d.remove(),3800);
 }}
 
-async function api(method, path, body=null) {{
-  const opts = {{ method, headers: {{'Content-Type':'application/json'}} }};
-  if (body) opts.body = JSON.stringify(body);
-  const r = await fetch(path, opts);
-  if (!r.ok) {{
-    const e = await r.json().catch(() => ({{detail:'خطا'}}));
-    throw new Error(e.detail || 'خطا');
+async function api(method,path,body=null){{
+  const o={{method,headers:{{'Content-Type':'application/json'}}}};
+  if(body) o.body=JSON.stringify(body);
+  const r=await fetch(path,o);
+  if(!r.ok){{
+    const e=await r.json().catch(()=>({{detail:'خطا'}}));
+    throw new Error(e.detail||'خطا');
   }}
   return r.json();
 }}
 
-function confirm_dialog(msg) {{
-  return new Promise(res => {{
-    const ok = window.confirm(msg);
-    res(ok);
-  }});
+function copy(txt){{
+  navigator.clipboard.writeText(txt)
+    .then(()=>toast('کپی شد ✓'))
+    .catch(()=>{{
+      const ta=document.createElement('textarea');
+      ta.value=txt;document.body.append(ta);ta.select();
+      document.execCommand('copy');ta.remove();toast('کپی شد ✓');
+    }});
 }}
 
-function copy_text(text) {{
-  navigator.clipboard.writeText(text).then(() => toast('کپی شد ✓')).catch(() => {{
-    const ta = document.createElement('textarea');
-    ta.value = text;
-    document.body.appendChild(ta);
-    ta.select();
-    document.execCommand('copy');
-    ta.remove();
-    toast('کپی شد ✓');
-  }});
+function fmtBytes(b){{
+  if(!b||b===0)return'0 B';
+  const u=['B','KB','MB','GB','TB'];let i=0;
+  while(b>=1024&&i<u.length-1){{b/=1024;i++;}}
+  return b.toFixed(2)+' '+u[i];
 }}
 
-function format_bytes(b) {{
-  if (!b) return '0 B';
-  const u = ['B','KB','MB','GB','TB'];
-  let i = 0;
-  while (b >= 1024 && i < u.length-1) {{ b /= 1024; i++; }}
-  return b.toFixed(2) + ' ' + u[i];
+function fmtDate(s){{
+  if(!s)return'—';
+  return new Date(s).toLocaleDateString('fa-IR',{{year:'numeric',month:'short',day:'numeric'}});
 }}
 
-function format_date(s) {{
-  if (!s) return '—';
-  const d = new Date(s);
-  return d.toLocaleDateString('fa-IR', {{ year:'numeric', month:'short', day:'numeric' }});
+function daysLeft(exp){{
+  if(!exp)return null;
+  return Math.ceil((new Date(exp)-new Date())/86400000);
 }}
 
-function days_left(expire_at) {{
-  if (!expire_at) return null;
-  const diff = new Date(expire_at) - new Date();
-  return Math.ceil(diff / 86400000);
-}}
+function confirm2(msg){{return window.confirm(msg)}}
 
-// ─── LOGIN PAGE ───────────────────────────────────────────────────────────────
-function render_login() {{
-  document.getElementById('login-wrapper').innerHTML = `
-  <div class="login-page">
-    <div class="login-card">
+// ══════════════════════════════════════════════════════
+//  LOGIN
+// ══════════════════════════════════════════════════════
+function renderLogin(){{
+  document.getElementById('login-root').innerHTML=`
+  <div class="login-scene">
+    <div class="login-box">
       <div class="login-logo">
-        <div class="icon">⚡</div>
-        <h1>XRay Panel</h1>
-        <p>مدیریت اشتراک VLESS</p>
+        <div class="login-ico">⚡</div>
+        <h1>IranX Panel</h1>
+        <p>پنل مدیریت VLESS</p>
       </div>
-      <form id="login-form">
-        <div class="form-group">
+      <form id="lf">
+        <div class="fg">
           <label>نام کاربری</label>
           <input name="username" type="text" placeholder="admin" required autocomplete="username">
         </div>
-        <div class="form-group">
+        <div class="fg">
           <label>رمز عبور</label>
           <input name="password" type="password" placeholder="••••••••" required autocomplete="current-password">
         </div>
-        <button type="submit" class="btn btn-primary btn-full" id="login-btn">
-          <i class="fa fa-sign-in-alt"></i> ورود به پنل
+        <button class="btn btn-primary btn-full" id="lbtn" type="submit">
+          <i class="fa fa-sign-in-alt"></i> ورود
         </button>
+        <p style="text-align:center;color:var(--txt3);font-size:12px;margin-top:16px" id="lerr"></p>
       </form>
     </div>
   </div>`;
-  
-  document.getElementById('login-form').onsubmit = async (e) => {{
+  document.getElementById('lf').onsubmit=async e=>{{
     e.preventDefault();
-    const btn = document.getElementById('login-btn');
-    btn.disabled = true;
-    btn.innerHTML = '<i class="fa fa-spinner spin"></i> در حال ورود...';
-    const fd = new FormData(e.target);
-    try {{
-      const r = await fetch('/api/login', {{ method:'POST', body: fd }});
-      if (r.ok) {{ window.location.reload(); }}
-      else {{
-        const err = await r.json();
-        toast(err.detail || 'خطا در ورود', 'error');
-        btn.disabled = false;
-        btn.innerHTML = '<i class="fa fa-sign-in-alt"></i> ورود به پنل';
+    const btn=document.getElementById('lbtn');
+    const err=document.getElementById('lerr');
+    btn.disabled=true;
+    btn.innerHTML='<i class="fa fa-spinner spin"></i> در حال ورود...';
+    const fd=new FormData(e.target);
+    try{{
+      const r=await fetch('/api/login',{{method:'POST',body:fd}});
+      if(r.ok){{window.location.reload()}}
+      else{{
+        const j=await r.json().catch(()=>({{detail:'خطا'}}));
+        err.textContent=j.detail||'خطا در ورود';
+        btn.disabled=false;
+        btn.innerHTML='<i class="fa fa-sign-in-alt"></i> ورود';
       }}
-    }} catch(e) {{
-      toast('خطا در اتصال', 'error');
-      btn.disabled = false;
-      btn.innerHTML = '<i class="fa fa-sign-in-alt"></i> ورود به پنل';
+    }}catch{{
+      err.textContent='خطا در اتصال';
+      btn.disabled=false;
+      btn.innerHTML='<i class="fa fa-sign-in-alt"></i> ورود';
     }}
   }};
 }}
 
-// ─── MAIN APP ─────────────────────────────────────────────────────────────────
-let current_page = 'dashboard';
-let users_data = [];
-let ips_data = [];
-let charts = {{}};
+// ══════════════════════════════════════════════════════
+//  APP SHELL
+// ══════════════════════════════════════════════════════
+let curPage='dashboard';
+let usersData=[];
+let ipsData=[];
+let statsData={{}};
+let charts={{}};
 
-function render_app() {{
-  document.getElementById('app-wrapper').innerHTML = `
-  <div class="sidebar-overlay" id="sidebar-overlay" onclick="toggle_sidebar()"></div>
-  <div class="app">
+function renderApp(){{
+  document.getElementById('app-root').innerHTML=`
+  <div class="overlay-backdrop" id="bk" onclick="closeSidebar()"></div>
+  <div class="layout">
     <aside class="sidebar" id="sidebar">
-      <div class="sidebar-logo">
-        <div class="logo-icon">⚡</div>
-        <div>
-          <h2>XRay Panel</h2>
-          <small>v{PANEL_VERSION}</small>
+      <div class="sidebar-head">
+        <div class="logo-box">⚡</div>
+        <div class="logo-text">
+          <h2>IranX Panel</h2>
+          <span>v${{VER}}</span>
         </div>
       </div>
-      <nav class="sidebar-nav">
-        <div class="nav-section">
-          <div class="nav-section-title">منو</div>
-          <div class="nav-item active" data-page="dashboard" onclick="navigate('dashboard')">
-            <span class="nav-icon"><i class="fa fa-chart-line"></i></span> داشبورد
-          </div>
-          <div class="nav-item" data-page="users" onclick="navigate('users')">
-            <span class="nav-icon"><i class="fa fa-users"></i></span> کاربران
-          </div>
-          <div class="nav-item" data-page="ips" onclick="navigate('ips')">
-            <span class="nav-icon"><i class="fa fa-network-wired"></i></span> IP های تمیز
-          </div>
-          <div class="nav-item" data-page="settings" onclick="navigate('settings')">
-            <span class="nav-icon"><i class="fa fa-cog"></i></span> تنظیمات
-          </div>
+      <nav class="nav">
+        <div class="nav-lbl">منو اصلی</div>
+        <div class="nav-item active" data-p="dashboard" onclick="nav('dashboard')">
+          <span class="nav-icon"><i class="fa fa-gauge-high"></i></span>داشبورد
+        </div>
+        <div class="nav-item" data-p="users" onclick="nav('users')">
+          <span class="nav-icon"><i class="fa fa-users"></i></span>کاربران
+          <span id="badge-users" style="margin-right:auto;background:rgba(34,211,238,0.15);color:var(--cyan);font-size:11px;font-weight:700;padding:2px 8px;border-radius:100px"></span>
+        </div>
+        <div class="nav-item" data-p="ips" onclick="nav('ips')">
+          <span class="nav-icon"><i class="fa fa-network-wired"></i></span>IP تمیز
+          <span id="badge-ips" style="margin-right:auto;background:rgba(16,185,129,0.15);color:var(--green);font-size:11px;font-weight:700;padding:2px 8px;border-radius:100px"></span>
+        </div>
+        <div class="nav-lbl" style="margin-top:4px">سیستم</div>
+        <div class="nav-item" data-p="settings" onclick="nav('settings')">
+          <span class="nav-icon"><i class="fa fa-sliders"></i></span>تنظیمات
         </div>
       </nav>
-      <div class="sidebar-footer">
-        <div class="user-info">
-          <div class="user-avatar">A</div>
+      <div class="sidebar-foot">
+        <div class="user-row">
+          <div class="user-ava">A</div>
           <div>
             <div class="user-name">Admin</div>
             <div class="user-role">مدیر سیستم</div>
           </div>
-          <button onclick="logout()" class="btn btn-danger btn-sm" style="margin-right:auto" title="خروج">
-            <i class="fa fa-sign-out-alt"></i>
+          <button class="logout-btn" onclick="logout()" title="خروج">
+            <i class="fa fa-power-off"></i>
           </button>
         </div>
       </div>
     </aside>
-    
-    <main class="main">
-      <div class="topbar">
-        <button class="mobile-menu-btn" onclick="toggle_sidebar()"><i class="fa fa-bars"></i></button>
-        <div>
-          <div class="topbar-title" id="page-title">داشبورد</div>
-          <div class="topbar-subtitle" id="page-subtitle">خوش آمدید</div>
+
+    <div class="main">
+      <header class="topbar">
+        <div class="topbar-left">
+          <button class="burger" onclick="openSidebar()"><i class="fa fa-bars"></i></button>
+          <div>
+            <div class="page-title" id="pg-title">داشبورد</div>
+            <div class="page-sub" id="pg-sub">خلاصه وضعیت سیستم</div>
+          </div>
         </div>
-        <div class="topbar-actions">
-          <button class="btn btn-secondary btn-sm" onclick="refresh_page()">
-            <i class="fa fa-sync"></i>
+        <div class="topbar-right" id="topbar-actions"></div>
+      </header>
+
+      <div class="content">
+        <div class="page active" id="p-dashboard"></div>
+        <div class="page" id="p-users"></div>
+        <div class="page" id="p-ips"></div>
+        <div class="page" id="p-settings"></div>
+      </div>
+    </div>
+  </div>`;
+
+  loadStats().then(()=>renderDashboard());
+  loadUsers().then(()=>{{ if(curPage==='users') renderUsers(); }});
+  loadIps().then(()=>{{ if(curPage==='ips') renderIps(); }});
+  setInterval(()=>loadStats().then(()=>{{ if(curPage==='dashboard') renderDashboard(); }}),15000);
+}}
+
+function openSidebar(){{
+  document.getElementById('sidebar').classList.add('open');
+  document.getElementById('bk').classList.add('show');
+}}
+function closeSidebar(){{
+  document.getElementById('sidebar').classList.remove('open');
+  document.getElementById('bk').classList.remove('show');
+}}
+
+const PAGES = {{
+  dashboard:{{title:'داشبورد',sub:'خلاصه وضعیت سیستم',icon:'fa-gauge-high'}},
+  users:{{title:'مدیریت کاربران',sub:'ساخت و ویرایش اشتراک‌ها',icon:'fa-users'}},
+  ips:{{title:'IP های تمیز',sub:'مدیریت آدرس‌های Cloudflare',icon:'fa-network-wired'}},
+  settings:{{title:'تنظیمات',sub:'پیکربندی پنل و VLESS',icon:'fa-sliders'}},
+}};
+
+function nav(page){{
+  curPage=page;
+  document.querySelectorAll('.nav-item').forEach(el=>{{
+    el.classList.toggle('active', el.dataset.p===page);
+  }});
+  document.querySelectorAll('.page').forEach(el=>el.classList.remove('active'));
+  document.getElementById('p-'+page).classList.add('active');
+  const pg=PAGES[page];
+  document.getElementById('pg-title').textContent=pg.title;
+  document.getElementById('pg-sub').textContent=pg.sub;
+  closeSidebar();
+  if(page==='dashboard') renderDashboard();
+  else if(page==='users') renderUsers();
+  else if(page==='ips') renderIps();
+  else if(page==='settings') renderSettings();
+}}
+
+// ══════════════════════════════════════════════════════
+//  DATA LOADERS
+// ══════════════════════════════════════════════════════
+async function loadStats(){{
+  try{{statsData=await api('GET','/api/stats');}}catch{{}}
+}}
+async function loadUsers(){{
+  try{{
+    usersData=await api('GET','/api/users');
+    const b=document.getElementById('badge-users');
+    if(b) b.textContent=usersData.filter(u=>u.is_active).length;
+  }}catch{{}}
+}}
+async function loadIps(){{
+  try{{
+    ipsData=await api('GET','/api/ips');
+    const b=document.getElementById('badge-ips');
+    if(b) b.textContent=ipsData.filter(i=>i.is_active).length;
+  }}catch{{}}
+}}
+
+// ══════════════════════════════════════════════════════
+//  DASHBOARD
+// ══════════════════════════════════════════════════════
+function renderDashboard(){{
+  const s=statsData;
+  if(!s||!s.system) return;
+  const sys=s.system;
+
+  const statCards=[
+    {{cls:'s-cyan',ico:'fa-users',val:s.total_users||0,lbl:'کل کاربران',hint:`${{s.active_users||0}} فعال`}},
+    {{cls:'s-green',ico:'fa-circle-check',val:s.active_users||0,lbl:'کاربران فعال',hint:`${{s.inactive_users||0}} غیرفعال`}},
+    {{cls:'s-red',ico:'fa-triangle-exclamation',val:s.expiring_soon||0,lbl:'منقضی می‌شوند',hint:'در ۳ روز آینده'}},
+    {{cls:'s-amber',ico:'fa-hard-drive',val:(s.total_traffic_gb||0).toFixed(1)+' GB',lbl:'ترافیک مصرفی',hint:'کل کاربران'}},
+    {{cls:'s-blue',ico:'fa-network-wired',val:s.active_ips||0,lbl:'IP تمیز',hint:'فعال'}},
+  ];
+
+  const cards=statCards.map(c=>`
+  <div class="stat ${{c.cls}}">
+    <div class="stat-stripe"></div>
+    <div class="stat-ico"><i class="fa ${{c.ico}}"></i></div>
+    <div class="stat-val">${{c.val}}</div>
+    <div class="stat-lbl">${{c.lbl}}</div>
+    <div class="stat-hint">${{c.hint}}</div>
+  </div>`).join('');
+
+  const cpu=sys.cpu||0, mem=sys.mem_percent||0, disk=sys.disk_percent||0;
+
+  function gauge(pct,color,label){{
+    const r=34,circ=2*Math.PI*r;
+    const off=circ*(1-pct/100);
+    return `
+    <div class="gauge-wrap">
+      <svg width="84" height="84" class="gauge-svg" viewBox="0 0 84 84">
+        <circle class="gauge-bg" cx="42" cy="42" r="${{r}}"/>
+        <circle class="gauge-fg" cx="42" cy="42" r="${{r}}"
+          stroke="${{color}}" stroke-dasharray="${{circ}}" stroke-dashoffset="${{off}}"/>
+        <text x="42" y="42" class="gauge-val" fill="${{color}}">${{Math.round(pct)}}%</text>
+      </svg>
+      <div class="gauge-lbl">${{label}}</div>
+    </div>`;
+  }}
+
+  document.getElementById('p-dashboard').innerHTML=`
+  <div class="stats-grid">${{cards}}</div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px">
+    <div class="card">
+      <div class="card-title">
+        <span class="ct-icon"><i class="fa fa-microchip"></i></span>
+        وضعیت سیستم
+      </div>
+      <div class="gauges">
+        ${{gauge(cpu,'var(--cyan)','CPU')}}
+        ${{gauge(mem,'var(--blue)','RAM')}}
+        ${{gauge(disk,'var(--violet)','Disk')}}
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:16px">
+        <div style="background:var(--surf2);border-radius:8px;padding:10px 12px">
+          <div style="font-size:11px;color:var(--txt3);margin-bottom:3px">RAM</div>
+          <div style="font-size:13px;font-weight:700">${{sys.mem_used_gb||0}} / ${{sys.mem_total_gb||0}} GB</div>
+        </div>
+        <div style="background:var(--surf2);border-radius:8px;padding:10px 12px">
+          <div style="font-size:11px;color:var(--txt3);margin-bottom:3px">Disk</div>
+          <div style="font-size:13px;font-weight:700">${{sys.disk_used_gb||0}} / ${{sys.disk_total_gb||0}} GB</div>
+        </div>
+        <div style="background:var(--surf2);border-radius:8px;padding:10px 12px">
+          <div style="font-size:11px;color:var(--txt3);margin-bottom:3px">Upload</div>
+          <div style="font-size:13px;font-weight:700">${{sys.net_sent_gb||0}} GB</div>
+        </div>
+        <div style="background:var(--surf2);border-radius:8px;padding:10px 12px">
+          <div style="font-size:11px;color:var(--txt3);margin-bottom:3px">Download</div>
+          <div style="font-size:13px;font-weight:700">${{sys.net_recv_gb||0}} GB</div>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title">
+        <span class="ct-icon"><i class="fa fa-users"></i></span>
+        آمار کاربران
+      </div>
+      <div style="display:flex;flex-direction:column;gap:10px">
+        <div style="display:flex;align-items:center;justify-content:space-between">
+          <span style="font-size:13px;color:var(--txt2)">فعال</span>
+          <span class="badge bg">${{s.active_users||0}}</span>
+        </div>
+        <div style="display:flex;align-items:center;justify-content:space-between">
+          <span style="font-size:13px;color:var(--txt2)">غیرفعال</span>
+          <span class="badge br">${{s.inactive_users||0}}</span>
+        </div>
+        <div style="display:flex;align-items:center;justify-content:space-between">
+          <span style="font-size:13px;color:var(--txt2)">منقضی شدنی (۳ روز)</span>
+          <span class="badge by">${{s.expiring_soon||0}}</span>
+        </div>
+        <div style="display:flex;align-items:center;justify-content:space-between">
+          <span style="font-size:13px;color:var(--txt2)">IP تمیز فعال</span>
+          <span class="badge bb">${{s.active_ips||0}}</span>
+        </div>
+        <div style="display:flex;align-items:center;justify-content:space-between">
+          <span style="font-size:13px;color:var(--txt2)">کل ترافیک</span>
+          <span style="font-size:13px;font-weight:700;color:var(--cyan)">${{(s.total_traffic_gb||0).toFixed(2)}} GB</span>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-title">
+      <span class="ct-icon"><i class="fa fa-users"></i></span>
+      آخرین کاربران فعال
+    </div>
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>نام</th><th>ترافیک</th><th>انقضا</th><th>وضعیت</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${{(usersData||[]).slice(0,5).map(u=>{{
+            const pct = u.traffic_limit_gb>0 ? Math.min(100,Math.round((u.used_traffic_bytes||0)/(u.traffic_limit_gb*1024**3)*100)) : 0;
+            const cls = pct>85?'prog-r':pct>60?'prog-y':'prog-g';
+            const dl = daysLeft(u.expire_at);
+            const exp = dl===null?'<span class="badge bb">∞</span>':dl<3?`<span class="badge br">${{dl}} روز</span>`:dl<10?`<span class="badge by">${{dl}} روز</span>`:`<span class="badge bg">${{dl}} روز</span>`;
+            return `<tr>
+              <td><span style="font-weight:600">${{u.flag||''}} ${{u.name}}</span></td>
+              <td>
+                <div style="font-size:12px;color:var(--txt2)">${{fmtBytes(u.used_traffic_bytes||0)}} / ${{u.traffic_limit_gb||'∞'}} GB</div>
+                <div class="prog"><div class="prog-bar ${{cls}}" style="width:${{pct}}%"></div></div>
+              </td>
+              <td>${{exp}}</td>
+              <td>${{u.is_active?'<span class="badge bg">● فعال</span>':'<span class="badge br">● غیرفعال</span>'}}</td>
+            </tr>`;
+          }}).join('')}}
+        </tbody>
+      </table>
+    </div>
+    ${{(usersData||[]).length>5?`<div style="text-align:center;margin-top:12px"><button class="btn btn-ghost btn-sm" onclick="nav('users')">مشاهده همه <i class="fa fa-arrow-left"></i></button></div>`:''}}
+  </div>`;
+}}
+
+// ══════════════════════════════════════════════════════
+//  USERS PAGE
+// ══════════════════════════════════════════════════════
+let userFilter='';
+
+function renderUsers(){{
+  const acts=`
+  <div class="search">
+    <i class="fa fa-search search-ico"></i>
+    <input placeholder="جستجوی کاربر..." oninput="filterUsers(this.value)" value="${{userFilter}}">
+  </div>
+  <button class="btn btn-primary btn-sm" onclick="openAddUser()">
+    <i class="fa fa-plus"></i> کاربر جدید
+  </button>`;
+  document.getElementById('topbar-actions').innerHTML=acts;
+
+  const filtered = usersData.filter(u=>
+    u.name.toLowerCase().includes(userFilter.toLowerCase())||
+    (u.email||'').toLowerCase().includes(userFilter.toLowerCase())
+  );
+
+  const rows=filtered.map(u=>{{
+    const lim=u.traffic_limit_gb;
+    const used=u.used_traffic_bytes||0;
+    const pct=lim>0?Math.min(100,Math.round(used/(lim*1024**3)*100)):0;
+    const cls=pct>85?'prog-r':pct>60?'prog-y':'prog-g';
+    const dl=daysLeft(u.expire_at);
+    const exp=dl===null?'—':dl<0?'<span class="badge br">منقضی</span>':dl<3?`<span class="badge br">${{dl}}d</span>`:dl<10?`<span class="badge by">${{dl}}d</span>`:`<span class="badge bg">${{dl}}d</span>`;
+    return `<tr>
+      <td>
+        <div style="font-weight:700">${{u.flag||''}} ${{u.name}}</div>
+        <div style="font-size:11px;color:var(--txt3)">${{u.email||''}}</div>
+      </td>
+      <td>
+        <div style="font-size:12px;color:var(--txt2);margin-bottom:4px">${{fmtBytes(used)}} / ${{lim||'∞'}} GB</div>
+        <div class="prog" style="width:100px"><div class="prog-bar ${{cls}}" style="width:${{pct}}%"></div></div>
+      </td>
+      <td>${{exp}}</td>
+      <td>
+        <label class="tog">
+          <input type="checkbox" ${{u.is_active?'checked':''}} onchange="toggleUser('${{u.uuid}}',this)">
+          <span class="tog-sl"></span>
+        </label>
+      </td>
+      <td>
+        <div style="display:flex;gap:6px;flex-wrap:wrap">
+          <button class="btn btn-sm bb" onclick="showSubLink('${{u.uuid}}','${{u.name}}')">
+            <i class="fa fa-link"></i>
+          </button>
+          <button class="btn btn-sm btn-ghost" onclick="openEditUser('${{u.uuid}}')">
+            <i class="fa fa-pen"></i>
+          </button>
+          <button class="btn btn-sm btn-amber" onclick="resetTraffic('${{u.uuid}}','${{u.name}}')">
+            <i class="fa fa-rotate-right"></i>
+          </button>
+          <button class="btn btn-sm btn-danger" onclick="deleteUser('${{u.uuid}}','${{u.name}}')">
+            <i class="fa fa-trash"></i>
           </button>
         </div>
-      </div>
-      
-      <div class="content">
-        <div id="page-dashboard" class="page active"></div>
-        <div id="page-users" class="page"></div>
-        <div id="page-ips" class="page"></div>
-        <div id="page-settings" class="page"></div>
-      </div>
-    </main>
+      </td>
+    </tr>`;
+  }}).join('');
+
+  document.getElementById('p-users').innerHTML=`
+  <div class="card">
+    <div class="card-title">
+      <span class="ct-icon"><i class="fa fa-users"></i></span>
+      کاربران (${{filtered.length}})
+    </div>
+    ${{filtered.length===0?`<div class="empty"><div class="empty-ico">👤</div><h3>کاربری پیدا نشد</h3><p>ابتدا یک کاربر اضافه کنید</p></div>`:
+    `<div class="tbl-wrap">
+      <table>
+        <thead><tr><th>نام / ایمیل</th><th>ترافیک</th><th>انقضا</th><th>فعال</th><th>عملیات</th></tr></thead>
+        <tbody>${{rows}}</tbody>
+      </table>
+    </div>`}}
   </div>`;
-  
-  render_dashboard();
-  navigate('dashboard');
 }}
 
-function toggle_sidebar() {{
-  document.getElementById('sidebar').classList.toggle('open');
-  document.getElementById('sidebar-overlay').classList.toggle('active');
+function filterUsers(v){{
+  userFilter=v;renderUsers();
 }}
 
-async function logout() {{
-  await fetch('/api/logout', {{method:'POST'}});
+async function toggleUser(uuid,cb){{
+  try{{
+    const r=await api('POST',`/api/users/${{uuid}}/toggle`);
+    usersData=usersData.map(u=>u.uuid===uuid?{{...u,is_active:r.is_active}}:u);
+    toast(r.is_active?'فعال شد':'غیرفعال شد');
+  }}catch(e){{toast(e.message,'err');cb.checked=!cb.checked;}}
+}}
+
+function openAddUser(){{
+  showModal(`<div class="m-head"><span class="m-title">👤 کاربر جدید</span><button class="m-close" onclick="closeModal()">✕</button></div>
+  <div class="m-body">
+    <div class="form-row">
+      <div class="fg"><label>نام *</label><input id="un" placeholder="Ali"></div>
+      <div class="fg"><label>ایمیل</label><input id="ue" placeholder="ali@example.com" type="email"></div>
+    </div>
+    <div class="form-row">
+      <div class="fg"><label>حجم (GB) — 0 = نامحدود</label><input id="ut" type="number" min="0" step="0.5" value="0"></div>
+      <div class="fg"><label>مدت (روز) — 0 = نامحدود</label><input id="ud" type="number" min="0" value="30"></div>
+    </div>
+    <div class="form-row">
+      <div class="fg"><label>پرچم / لیبل (اختیاری)</label><input id="uf" placeholder="🇮🇷"></div>
+      <div class="fg"><label>یادداشت</label><input id="unote" placeholder="..."></div>
+    </div>
+  </div>
+  <div class="m-foot">
+    <button class="btn btn-ghost" onclick="closeModal()">انصراف</button>
+    <button class="btn btn-primary" onclick="submitAddUser()"><i class="fa fa-check"></i> ذخیره</button>
+  </div>`);
+}}
+
+async function submitAddUser(){{
+  const name=document.getElementById('un').value.trim();
+  if(!name)return toast('نام الزامی است','err');
+  try{{
+    await api('POST','/api/users',{{
+      name,
+      email:document.getElementById('ue').value,
+      traffic_limit_gb:parseFloat(document.getElementById('ut').value)||0,
+      expire_days:parseInt(document.getElementById('ud').value)||0,
+      flag:document.getElementById('uf').value,
+      note:document.getElementById('unote').value,
+    }});
+    closeModal();toast('کاربر ساخته شد ✓');
+    await loadUsers();renderUsers();
+  }}catch(e){{toast(e.message,'err');}}
+}}
+
+async function openEditUser(uuid){{
+  const u=usersData.find(x=>x.uuid===uuid);
+  if(!u)return;
+  showModal(`<div class="m-head"><span class="m-title">✏️ ویرایش ${{u.name}}</span><button class="m-close" onclick="closeModal()">✕</button></div>
+  <div class="m-body">
+    <div class="form-row">
+      <div class="fg"><label>نام</label><input id="en" value="${{u.name}}"></div>
+      <div class="fg"><label>ایمیل</label><input id="ee" value="${{u.email||''}}"></div>
+    </div>
+    <div class="form-row">
+      <div class="fg"><label>حجم (GB)</label><input id="et" type="number" min="0" step="0.5" value="${{u.traffic_limit_gb||0}}"></div>
+      <div class="fg"><label>مدت (روز)</label><input id="ed" type="number" min="0" value="${{u.expire_days||0}}"></div>
+    </div>
+    <div class="form-row">
+      <div class="fg"><label>پرچم</label><input id="ef" value="${{u.flag||''}}"></div>
+      <div class="fg"><label>وضعیت</label>
+        <select id="es">
+          <option value="1" ${{u.is_active?'selected':''}}>فعال</option>
+          <option value="0" ${{!u.is_active?'selected':''}}>غیرفعال</option>
+        </select>
+      </div>
+    </div>
+    <div class="fg"><label>یادداشت</label><textarea id="enote">${{u.note||''}}</textarea></div>
+  </div>
+  <div class="m-foot">
+    <button class="btn btn-ghost" onclick="closeModal()">انصراف</button>
+    <button class="btn btn-primary" onclick="submitEditUser('${{uuid}}')"><i class="fa fa-check"></i> ذخیره</button>
+  </div>`);
+}}
+
+async function submitEditUser(uuid){{
+  try{{
+    await api('PUT',`/api/users/${{uuid}}`,{{
+      name:document.getElementById('en').value.trim(),
+      email:document.getElementById('ee').value,
+      traffic_limit_gb:parseFloat(document.getElementById('et').value)||0,
+      expire_days:parseInt(document.getElementById('ed').value)||0,
+      flag:document.getElementById('ef').value,
+      is_active:parseInt(document.getElementById('es').value),
+      note:document.getElementById('enote').value,
+    }});
+    closeModal();toast('ذخیره شد ✓');
+    await loadUsers();renderUsers();
+  }}catch(e){{toast(e.message,'err');}}
+}}
+
+async function deleteUser(uuid,name){{
+  if(!confirm2(`کاربر "${{name}}" حذف شود?`))return;
+  try{{
+    await api('DELETE',`/api/users/${{uuid}}`);
+    toast('حذف شد');
+    await loadUsers();renderUsers();
+  }}catch(e){{toast(e.message,'err');}}
+}}
+
+async function resetTraffic(uuid,name){{
+  if(!confirm2(`ترافیک "${{name}}" ریست شود?`))return;
+  try{{
+    await api('POST',`/api/users/${{uuid}}/reset-traffic`);
+    toast('ترافیک ریست شد');
+    await loadUsers();renderUsers();
+  }}catch(e){{toast(e.message,'err');}}
+}}
+
+async function showSubLink(uuid,name){{
+  try{{
+    const d=await api('GET',`/api/users/${{uuid}}/sub-link`);
+    const u=usersData.find(x=>x.uuid===uuid)||{{}};
+    const lim=u.traffic_limit_gb||0;
+    const used=u.used_traffic_bytes||0;
+    const rem=lim>0?Math.max(0,lim-used/1024**3).toFixed(2):'∞';
+    const dl=daysLeft(u.expire_at);
+    const daysStr=dl===null?'∞':dl<0?'منقضی شده':`${{dl}} روز`;
+
+    const ipRows=(d.ip_links||[]).map(ip=>`
+    <div style="margin-bottom:8px">
+      <div style="font-size:11px;color:var(--txt3);margin-bottom:4px">
+        <span class="ip-chip">${{ip.ip}}</span>
+        ${{ip.label?`<span style="margin-right:6px">${{ip.label}}</span>`:''}}
+      </div>
+      <div class="copy-box"><span class="cb-txt">${{ip.link}}</span>
+        <button class="copy-btn" onclick="copy('${{ip.link}}')"><i class="fa fa-copy"></i></button>
+      </div>
+    </div>`).join('');
+
+    showModal(`<div class="m-head">
+      <span class="m-title">🔗 لینک‌های ${{name}}</span>
+      <button class="m-close" onclick="closeModal()">✕</button>
+    </div>
+    <div class="m-body">
+      <div class="info-band">
+        <div class="info-cell">
+          <div class="iv">${{rem}}</div>
+          <div class="il">GB باقی‌مانده</div>
+        </div>
+        <div class="info-cell">
+          <div class="iv">${{daysStr}}</div>
+          <div class="il">زمان باقی‌مانده</div>
+        </div>
+        <div class="info-cell">
+          <div class="iv">${{(d.ip_links||[]).length||1}}</div>
+          <div class="il">تعداد کانفیگ</div>
+        </div>
+      </div>
+
+      <div style="margin-bottom:14px">
+        <div style="font-size:12px;font-weight:700;color:var(--txt2);margin-bottom:8px">
+          <i class="fa fa-link" style="color:var(--cyan)"></i> لینک اشتراک (Sub Link)
+        </div>
+        <div class="copy-box">
+          <span class="cb-txt">${{d.sub_link}}</span>
+          <button class="copy-btn" onclick="copy('${{d.sub_link}}')"><i class="fa fa-copy"></i></button>
+        </div>
+        <div style="font-size:11px;color:var(--txt3)">⚡ این لینک در کلاینت‌هایی مثل Hiddify, v2rayNG, Clash وارد کنید</div>
+      </div>
+
+      <div style="margin-bottom:14px">
+        <div style="font-size:12px;font-weight:700;color:var(--txt2);margin-bottom:8px">
+          <i class="fa fa-bolt" style="color:var(--violet)"></i> کانفیگ مستقیم VLESS
+        </div>
+        <div class="copy-box"><span class="cb-txt">${{d.vless_link}}</span>
+          <button class="copy-btn" onclick="copy('${{d.vless_link}}')"><i class="fa fa-copy"></i></button>
+        </div>
+      </div>
+
+      ${{ipRows?`<div>
+        <div style="font-size:12px;font-weight:700;color:var(--txt2);margin-bottom:8px">
+          <i class="fa fa-network-wired" style="color:var(--green)"></i> کانفیگ IP تمیز
+        </div>
+        ${{ipRows}}
+      </div>`:''}}
+    </div>
+    <div class="m-foot">
+      <button class="btn btn-ghost btn-sm" onclick="closeModal()">بستن</button>
+      <button class="btn btn-primary btn-sm" onclick="copy('${{d.sub_link}}')">
+        <i class="fa fa-copy"></i> کپی Sub Link
+      </button>
+    </div>`, true);
+  }}catch(e){{toast(e.message,'err');}}
+}}
+
+// ══════════════════════════════════════════════════════
+//  CLEAN IPs PAGE
+// ══════════════════════════════════════════════════════
+function renderIps(){{
+  document.getElementById('topbar-actions').innerHTML=`
+  <button class="btn btn-primary btn-sm" onclick="openAddIp()">
+    <i class="fa fa-plus"></i> IP جدید
+  </button>
+  <button class="btn btn-ghost btn-sm" onclick="openBulkIp()">
+    <i class="fa fa-list"></i> انبوه
+  </button>`;
+
+  const rows=ipsData.map(ip=>`
+  <tr>
+    <td><span class="ip-chip">${{ip.ip}}</span></td>
+    <td>${{ip.label||'—'}}</td>
+    <td>${{fmtDate(ip.added_at)}}</td>
+    <td>
+      <label class="tog">
+        <input type="checkbox" ${{ip.is_active?'checked':''}} onchange="toggleIp(${{ip.id}},this)">
+        <span class="tog-sl"></span>
+      </label>
+    </td>
+    <td>
+      <button class="btn btn-sm btn-danger" onclick="deleteIp(${{ip.id}})">
+        <i class="fa fa-trash"></i>
+      </button>
+    </td>
+  </tr>`).join('');
+
+  document.getElementById('p-ips').innerHTML=`
+  <div class="card" style="margin-bottom:12px">
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+      <span style="font-size:13px;color:var(--txt2)">
+        <i class="fa fa-info-circle" style="color:var(--cyan)"></i>
+        IP تمیزها در subscription link هر کاربر به صورت یک کانفیگ جدا اضافه می‌شوند.
+      </span>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-title">
+      <span class="ct-icon"><i class="fa fa-network-wired"></i></span>
+      IP های تمیز (${{ipsData.length}})
+    </div>
+    ${{ipsData.length===0?`<div class="empty"><div class="empty-ico">🌐</div><h3>IP تمیزی ثبت نشده</h3><p>IP های Cloudflare را اضافه کنید</p></div>`:
+    `<div class="tbl-wrap">
+      <table>
+        <thead><tr><th>آدرس IP</th><th>لیبل</th><th>تاریخ</th><th>فعال</th><th>حذف</th></tr></thead>
+        <tbody>${{rows}}</tbody>
+      </table>
+    </div>`}}
+  </div>`;
+}}
+
+function openAddIp(){{
+  showModal(`<div class="m-head"><span class="m-title">🌐 IP جدید</span><button class="m-close" onclick="closeModal()">✕</button></div>
+  <div class="m-body">
+    <div class="fg"><label>آدرس IP *</label><input id="ip-addr" placeholder="1.2.3.4"></div>
+    <div class="fg"><label>لیبل (اختیاری)</label><input id="ip-label" placeholder="CF-1"></div>
+  </div>
+  <div class="m-foot">
+    <button class="btn btn-ghost" onclick="closeModal()">انصراف</button>
+    <button class="btn btn-primary" onclick="submitAddIp()"><i class="fa fa-check"></i> اضافه کن</button>
+  </div>`);
+}}
+
+async function submitAddIp(){{
+  const ip=document.getElementById('ip-addr').value.trim();
+  if(!ip)return toast('IP الزامی است','err');
+  try{{
+    await api('POST','/api/ips',{{ip,label:document.getElementById('ip-label').value.trim()}});
+    closeModal();toast('IP اضافه شد ✓');
+    await loadIps();renderIps();
+  }}catch(e){{toast(e.message,'err');}}
+}}
+
+function openBulkIp(){{
+  showModal(`<div class="m-head"><span class="m-title">📋 اضافه انبوه</span><button class="m-close" onclick="closeModal()">✕</button></div>
+  <div class="m-body">
+    <div class="fg">
+      <label>IP ها (هر خط یک IP، می‌توانید بعد از IP فاصله و لیبل بزنید)</label>
+      <textarea id="bulk-ips" style="height:180px;font-family:monospace;direction:ltr;text-align:left" placeholder="1.1.1.1 Cloudflare-1&#10;1.0.0.1 Cloudflare-2&#10;104.16.0.0"></textarea>
+    </div>
+  </div>
+  <div class="m-foot">
+    <button class="btn btn-ghost" onclick="closeModal()">انصراف</button>
+    <button class="btn btn-primary" onclick="submitBulkIp()"><i class="fa fa-check"></i> اضافه کن</button>
+  </div>`);
+}}
+
+async function submitBulkIp(){{
+  const txt=document.getElementById('bulk-ips').value;
+  try{{
+    const r=await api('POST','/api/ips/bulk',{{ips:txt}});
+    closeModal();toast(`${{r.added}} IP اضافه شد ✓`);
+    await loadIps();renderIps();
+  }}catch(e){{toast(e.message,'err');}}
+}}
+
+async function toggleIp(id,cb){{
+  try{{
+    const r=await api('POST',`/api/ips/${{id}}/toggle`);
+    ipsData=ipsData.map(i=>i.id===id?{{...i,is_active:r.is_active}}:i);
+    toast(r.is_active?'فعال شد':'غیرفعال شد');
+  }}catch(e){{toast(e.message,'err');cb.checked=!cb.checked;}}
+}}
+
+async function deleteIp(id){{
+  if(!confirm2('این IP حذف شود?'))return;
+  try{{
+    await api('DELETE',`/api/ips/${{id}}`);
+    toast('حذف شد');
+    await loadIps();renderIps();
+  }}catch(e){{toast(e.message,'err');}}
+}}
+
+// ══════════════════════════════════════════════════════
+//  SETTINGS PAGE
+// ══════════════════════════════════════════════════════
+async function renderSettings(){{
+  document.getElementById('topbar-actions').innerHTML='';
+  let s={{}};
+  try{{s=await api('GET','/api/settings');}}catch{{}}
+
+  document.getElementById('p-settings').innerHTML=`
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+    <div class="card">
+      <div class="card-title"><span class="ct-icon"><i class="fa fa-globe"></i></span>تنظیمات VLESS</div>
+      <div class="fg"><label>دامنه / SNI</label><input id="s-sni" value="${{s.sni||''}}"></div>
+      <div class="fg"><label>Host Header</label><input id="s-host" value="${{s.host_header||''}}"></div>
+      <div class="fg"><label>TLS Fingerprint</label>
+        <select id="s-fp">
+          ${{['chrome','firefox','safari','edge','ios','android','random'].map(v=>`<option ${{s.tls_fingerprint===v?'selected':''}}>${{v}}</option>`).join('')}}
+        </select>
+      </div>
+      <div class="fg"><label>Fragment (اختیاری)</label><input id="s-frag" value="${{s.fragment||''}}"></div>
+      <button class="btn btn-primary" onclick="saveVlessSettings()"><i class="fa fa-save"></i> ذخیره</button>
+    </div>
+    <div class="card">
+      <div class="card-title"><span class="ct-icon"><i class="fa fa-robot"></i></span>تلگرام</div>
+      <div class="fg"><label>Bot Token</label><input id="s-tgtoken" value="${{s.tg_bot_token||''}}" type="password"></div>
+      <div class="fg"><label>Chat ID</label><input id="s-tgchat" value="${{s.tg_chat_id||''}}"></div>
+      <div class="fg">
+        <label style="display:flex;align-items:center;gap:10px;cursor:pointer">
+          <label class="tog">
+            <input type="checkbox" id="s-tgen" ${{s.tg_enabled==='1'?'checked':''}}>
+            <span class="tog-sl"></span>
+          </label>
+          فعال‌سازی اعلان تلگرام
+        </label>
+      </div>
+      <button class="btn btn-primary" onclick="saveTgSettings()"><i class="fa fa-save"></i> ذخیره</button>
+    </div>
+    <div class="card">
+      <div class="card-title"><span class="ct-icon"><i class="fa fa-circle-dot"></i></span>Keep-Alive</div>
+      <div class="fg">
+        <label style="display:flex;align-items:center;gap:10px;cursor:pointer">
+          <label class="tog">
+            <input type="checkbox" id="s-kaen" ${{s.keepalive_enabled==='1'?'checked':''}}>
+            <span class="tog-sl"></span>
+          </label>
+          فعال‌سازی Keep-Alive
+        </label>
+      </div>
+      <div class="fg"><label>فاصله (ثانیه)</label><input id="s-kaint" type="number" value="${{s.keepalive_interval||300}}"></div>
+      <button class="btn btn-primary" onclick="saveKaSettings()"><i class="fa fa-save"></i> ذخیره</button>
+    </div>
+    <div class="card">
+      <div class="card-title"><span class="ct-icon"><i class="fa fa-info"></i></span>اطلاعات پنل</div>
+      <div style="display:flex;flex-direction:column;gap:10px">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <span style="color:var(--txt2);font-size:13px">نسخه</span>
+          <span class="badge bb">v${{VER}}</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <span style="color:var(--txt2);font-size:13px">دامنه فعلی</span>
+          <span class="ip-chip" style="font-size:11px">${{s.sni||'—'}}</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <span style="color:var(--txt2);font-size:13px">کل کاربران</span>
+          <span style="font-weight:700">${{statsData.total_users||0}}</span>
+        </div>
+      </div>
+    </div>
+  </div>`;
+}}
+
+async function saveVlessSettings(){{
+  try{{
+    await api('POST','/api/settings',{{
+      sni:document.getElementById('s-sni').value,
+      host_header:document.getElementById('s-host').value,
+      tls_fingerprint:document.getElementById('s-fp').value,
+      fragment:document.getElementById('s-frag').value,
+    }});
+    toast('تنظیمات VLESS ذخیره شد ✓');
+  }}catch(e){{toast(e.message,'err');}}
+}}
+
+async function saveTgSettings(){{
+  try{{
+    await api('POST','/api/settings',{{
+      tg_bot_token:document.getElementById('s-tgtoken').value,
+      tg_chat_id:document.getElementById('s-tgchat').value,
+      tg_enabled:document.getElementById('s-tgen').checked?'1':'0',
+    }});
+    toast('تنظیمات تلگرام ذخیره شد ✓');
+  }}catch(e){{toast(e.message,'err');}}
+}}
+
+async function saveKaSettings(){{
+  try{{
+    await api('POST','/api/settings',{{
+      keepalive_enabled:document.getElementById('s-kaen').checked?'1':'0',
+      keepalive_interval:document.getElementById('s-kaint').value,
+    }});
+    toast('Keep-Alive ذخیره شد ✓');
+  }}catch(e){{toast(e.message,'err');}}
+}}
+
+// ══════════════════════════════════════════════════════
+//  MODAL HELPER
+// ══════════════════════════════════════════════════════
+function showModal(html, large=false){{
+  closeModal();
+  const ov=document.createElement('div');
+  ov.className='overlay';ov.id='modal-ov';
+  ov.onclick=e=>{{if(e.target===ov)closeModal()}};
+  const m=document.createElement('div');
+  m.className='modal'+(large?' modal-lg':'');
+  m.innerHTML=html;
+  ov.append(m);
+  document.body.append(ov);
+}}
+
+function closeModal(){{
+  document.getElementById('modal-ov')?.remove();
+}}
+
+// ══════════════════════════════════════════════════════
+//  AUTH
+// ══════════════════════════════════════════════════════
+async function logout(){{
+  await fetch('/api/logout',{{method:'POST'}}).catch(()=>{{}});
   window.location.reload();
 }}
 
-function navigate(page) {{
-  current_page = page;
-  document.querySelectorAll('.nav-item').forEach(el => {{
-    el.classList.toggle('active', el.dataset.page === page);
-  }});
-  document.querySelectorAll('.page').forEach(el => {{
-    el.classList.toggle('active', el.id === 'page-' + page);
-  }});
-  const titles = {{
-    dashboard: ['داشبورد', 'وضعیت کلی سیستم'],
-    users: ['کاربران', 'مدیریت کاربران و اشتراک‌ها'],
-    ips: ['IP های تمیز', 'مدیریت آدرس‌های IP'],
-    settings: ['تنظیمات', 'پیکربندی پنل']
-  }};
-  document.getElementById('page-title').textContent = titles[page]?.[0] || page;
-  document.getElementById('page-subtitle').textContent = titles[page]?.[1] || '';
-  
-  // Close mobile sidebar
-  document.getElementById('sidebar').classList.remove('open');
-  document.getElementById('sidebar-overlay').classList.remove('active');
-  
-  if (page === 'dashboard') render_dashboard();
-  else if (page === 'users') render_users();
-  else if (page === 'ips') render_ips();
-  else if (page === 'settings') render_settings();
-}}
-
-function refresh_page() {{ navigate(current_page); }}
-
-// ─── DASHBOARD ─────────────────────────────────────────────────────────────
-async function render_dashboard() {{
-  const el = document.getElementById('page-dashboard');
-  el.innerHTML = `<div style="color:var(--text2);text-align:center;padding:40px"><i class="fa fa-spinner spin fa-2x"></i></div>`;
-  
-  try {{
-    const stats = await api('GET', '/api/stats');
-    const sys = stats.system || {{}};
-    
-    el.innerHTML = `
-    <div class="stats-grid">
-      <div class="stat-card accent">
-        <div class="stat-icon accent"><i class="fa fa-users"></i></div>
-        <div class="stat-value">${{stats.total_users}}</div>
-        <div class="stat-label">کل کاربران</div>
-      </div>
-      <div class="stat-card green">
-        <div class="stat-icon green"><i class="fa fa-user-check"></i></div>
-        <div class="stat-value">${{stats.active_users}}</div>
-        <div class="stat-label">کاربران فعال</div>
-      </div>
-      <div class="stat-card red">
-        <div class="stat-icon red"><i class="fa fa-user-times"></i></div>
-        <div class="stat-value">${{stats.inactive_users}}</div>
-        <div class="stat-label">کاربران غیرفعال</div>
-      </div>
-      <div class="stat-card yellow">
-        <div class="stat-icon yellow"><i class="fa fa-clock"></i></div>
-        <div class="stat-value">${{stats.expiring_soon}}</div>
-        <div class="stat-label">در حال انقضا</div>
-        <div class="stat-sub">۳ روز آینده</div>
-      </div>
-      <div class="stat-card blue">
-        <div class="stat-icon blue"><i class="fa fa-database"></i></div>
-        <div class="stat-value">${{stats.total_traffic_gb.toFixed(1)}}</div>
-        <div class="stat-label">کل ترافیک مصرفی (GB)</div>
-      </div>
-      <div class="stat-card accent">
-        <div class="stat-icon accent"><i class="fa fa-network-wired"></i></div>
-        <div class="stat-value">${{stats.active_ips}}</div>
-        <div class="stat-label">IP فعال</div>
-      </div>
-    </div>
-    
-    <div class="grid-2">
-      <div class="card">
-        <div class="card-title"><i class="fa fa-heartbeat" style="color:var(--green)"></i> سلامت سیستم</div>
-        <div class="health-grid">
-          <div class="health-item">
-            <div class="health-circle" style="background: conic-gradient(#6366f1 ${{sys.cpu||0}}%, var(--bg3) 0%)">
-              <span>${{(sys.cpu||0).toFixed(0)}}%</span>
-            </div>
-            <div class="health-label">CPU</div>
-          </div>
-          <div class="health-item">
-            <div class="health-circle" style="background: conic-gradient(#10b981 ${{sys.mem_percent||0}}%, var(--bg3) 0%)">
-              <span>${{(sys.mem_percent||0).toFixed(0)}}%</span>
-            </div>
-            <div class="health-label">RAM</div>
-          </div>
-          <div class="health-item">
-            <div class="health-circle" style="background: conic-gradient(#f59e0b ${{sys.disk_percent||0}}%, var(--bg3) 0%)">
-              <span>${{(sys.disk_percent||0).toFixed(0)}}%</span>
-            </div>
-            <div class="health-label">Disk</div>
-          </div>
-        </div>
-        <div style="margin-top:20px;display:grid;grid-template-columns:1fr 1fr;gap:12px">
-          <div style="background:var(--bg3);padding:12px;border-radius:8px;font-size:13px">
-            <div style="color:var(--text2);margin-bottom:4px">RAM</div>
-            <div>${{sys.mem_used_gb||0}} / ${{sys.mem_total_gb||0}} GB</div>
-          </div>
-          <div style="background:var(--bg3);padding:12px;border-radius:8px;font-size:13px">
-            <div style="color:var(--text2);margin-bottom:4px">Disk</div>
-            <div>${{sys.disk_used_gb||0}} / ${{sys.disk_total_gb||0}} GB</div>
-          </div>
-          <div style="background:var(--bg3);padding:12px;border-radius:8px;font-size:13px">
-            <div style="color:var(--text2);margin-bottom:4px">ارسال شبکه</div>
-            <div>${{sys.net_sent_gb||0}} GB</div>
-          </div>
-          <div style="background:var(--bg3);padding:12px;border-radius:8px;font-size:13px">
-            <div style="color:var(--text2);margin-bottom:4px">دریافت شبکه</div>
-            <div>${{sys.net_recv_gb||0}} GB</div>
-          </div>
-        </div>
-      </div>
-      
-      <div class="card">
-        <div class="card-title"><i class="fa fa-chart-pie" style="color:var(--accent)"></i> توزیع کاربران</div>
-        <div class="chart-container">
-          <canvas id="users-chart"></canvas>
-        </div>
-      </div>
-    </div>
-    
-    <div class="card">
-      <div class="card-title"><i class="fa fa-list" style="color:var(--blue)"></i> کاربران اخیر</div>
-      <div id="recent-users-table"></div>
-    </div>`;
-    
-    // Chart
-    const ctx = document.getElementById('users-chart');
-    if (ctx) {{
-      if (charts.users) charts.users.destroy();
-      charts.users = new Chart(ctx, {{
-        type: 'doughnut',
-        data: {{
-          labels: ['فعال', 'غیرفعال', 'در حال انقضا'],
-          datasets: [{{ 
-            data: [stats.active_users, stats.inactive_users, stats.expiring_soon],
-            backgroundColor: ['#10b981','#ef4444','#f59e0b'],
-            borderWidth: 0,
-            hoverOffset: 8
-          }}]
-        }},
-        options: {{
-          responsive: true, maintainAspectRatio: false,
-          plugins: {{ legend: {{ position: 'bottom', labels: {{ color: '#94a3b8', padding: 16 }} }} }},
-          cutout: '65%'
-        }}
-      }});
-    }}
-    
-    // Recent users
-    const users = await api('GET', '/api/users');
-    users_data = users;
-    const recent = users.slice(0, 5);
-    const rtd = document.getElementById('recent-users-table');
-    if (recent.length === 0) {{
-      rtd.innerHTML = '<div class="empty-state"><div class="empty-icon">👥</div><h3>کاربری وجود ندارد</h3></div>';
-    }} else {{
-      rtd.innerHTML = `
-      <div class="table-wrapper">
-      <table>
-        <thead><tr>
-          <th>نام</th><th>ترافیک</th><th>انقضا</th><th>وضعیت</th>
-        </tr></thead>
-        <tbody>
-          ${{recent.map(u => `
-          <tr>
-            <td><span class="flag">${{u.flag}}</span>${{u.name}}</td>
-            <td>
-              <div>${{u.used_traffic_gb}} / ${{u.traffic_limit_gb||'∞'}} GB</div>
-              <div class="progress"><div class="progress-bar ${{u.traffic_percent<60?'green':u.traffic_percent<85?'yellow':'red'}}" style="width:${{u.traffic_percent}}%"></div></div>
-            </td>
-            <td>${{format_date(u.expire_at)}}</td>
-            <td><span class="badge ${{u.is_active?'badge-green':'badge-red'}}">${{u.is_active?'✓ فعال':'✗ غیرفعال'}}</span></td>
-          </tr>`).join('')}}
-        </tbody>
-      </table>
-      </div>`;
-    }}
-    
-  }} catch(e) {{
-    el.innerHTML = `<div class="card"><p style="color:var(--red)">${{e.message}}</p></div>`;
-  }}
-}}
-
-// ─── USERS PAGE ─────────────────────────────────────────────────────────────
-async function render_users() {{
-  const el = document.getElementById('page-users');
-  el.innerHTML = `
-  <div class="card" style="margin-bottom:20px">
-    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
-      <div class="search-bar">
-        <i class="fa fa-search search-icon"></i>
-        <input type="text" id="users-search" placeholder="جستجو در کاربران..." oninput="filter_users()">
-      </div>
-      <button class="btn btn-primary" onclick="show_add_user_modal()">
-        <i class="fa fa-plus"></i> کاربر جدید
-      </button>
-    </div>
-  </div>
-  <div class="card">
-    <div id="users-table-wrapper"><div style="text-align:center;padding:40px;color:var(--text2)"><i class="fa fa-spinner spin fa-2x"></i></div></div>
-  </div>`;
-  
-  await load_users();
-}}
-
-let users_filtered = [];
-
-async function load_users() {{
-  try {{
-    users_data = await api('GET', '/api/users');
-    users_filtered = [...users_data];
-    render_users_table();
-  }} catch(e) {{
-    toast(e.message, 'error');
-  }}
-}}
-
-function filter_users() {{
-  const q = document.getElementById('users-search')?.value?.toLowerCase() || '';
-  users_filtered = users_data.filter(u => u.name.toLowerCase().includes(q) || u.uuid.includes(q) || (u.email||'').toLowerCase().includes(q));
-  render_users_table();
-}}
-
-function render_users_table() {{
-  const el = document.getElementById('users-table-wrapper');
-  if (!el) return;
-  if (users_filtered.length === 0) {{
-    el.innerHTML = `<div class="empty-state"><div class="empty-icon">👥</div><h3>کاربری یافت نشد</h3><p>کاربر جدید اضافه کنید</p></div>`;
-    return;
-  }}
-  el.innerHTML = `
-  <div class="table-wrapper">
-  <table>
-    <thead><tr>
-      <th>نام</th><th>UUID</th><th>ترافیک</th><th>انقضا</th><th>وضعیت</th><th>عملیات</th>
-    </tr></thead>
-    <tbody>
-      ${{users_filtered.map(u => {{
-        const dl = days_left(u.expire_at);
-        const dl_badge = dl === null ? '' : dl <= 0 ? '<span class="badge badge-red">منقضی</span>' : dl <= 3 ? `<span class="badge badge-yellow">${{dl}} روز</span>` : `<span class="badge badge-green">${{dl}} روز</span>`;
-        return `<tr>
-          <td>
-            <div style="display:flex;align-items:center;gap:8px">
-              <div style="width:32px;height:32px;border-radius:50%;background:linear-gradient(135deg,#6366f1,#10b981);display:flex;align-items:center;justify-content:center;font-weight:700;font-size:13px;flex-shrink:0">${{u.name[0].toUpperCase()}}</div>
-              <div>
-                <div style="font-weight:600"><span class="flag">${{u.flag}}</span>${{u.name}}</div>
-                ${{u.email ? `<div style="font-size:11px;color:var(--text3)">${{u.email}}</div>` : ''}}
-              </div>
-            </div>
-          </td>
-          <td>
-            <div style="display:flex;align-items:center;gap:6px">
-              <code style="font-size:11px;color:var(--text3)">${{u.uuid.substring(0,8)}}...</code>
-              <button class="copy-btn" onclick="copy_text('${{u.uuid}}')" title="کپی UUID"><i class="fa fa-copy"></i></button>
-            </div>
-          </td>
-          <td>
-            <div style="min-width:120px">
-              <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px">
-                <span>${{u.used_traffic_gb}} GB</span>
-                <span style="color:var(--text3)">${{u.traffic_limit_gb > 0 ? u.traffic_limit_gb + ' GB' : '∞'}}</span>
-              </div>
-              <div class="progress">
-                <div class="progress-bar ${{u.traffic_percent<60?'green':u.traffic_percent<85?'yellow':'red'}}" style="width:${{u.traffic_percent}}%"></div>
-              </div>
-            </div>
-          </td>
-          <td>${{dl_badge}} ${{format_date(u.expire_at)}}</td>
-          <td>
-            <label class="toggle">
-              <input type="checkbox" ${{u.is_active?'checked':''}} onchange="toggle_user('${{u.uuid}}',this)">
-              <span class="toggle-slider"></span>
-            </label>
-          </td>
-          <td>
-            <div style="display:flex;gap:6px;flex-wrap:wrap">
-              <button class="btn btn-secondary btn-sm" onclick="show_sub_link('${{u.uuid}}','${{u.name}}')" title="لینک اشتراک"><i class="fa fa-link"></i></button>
-              <button class="btn btn-warning btn-sm" onclick="reset_traffic('${{u.uuid}}','${{u.name}}')" title="ریست ترافیک"><i class="fa fa-redo"></i></button>
-              <button class="btn btn-success btn-sm" onclick="show_edit_user_modal('${{u.uuid}}')" title="ویرایش"><i class="fa fa-edit"></i></button>
-              <button class="btn btn-danger btn-sm" onclick="delete_user('${{u.uuid}}','${{u.name}}')" title="حذف"><i class="fa fa-trash"></i></button>
-            </div>
-          </td>
-        </tr>`;
-      }}).join('')}}
-    </tbody>
-  </table>
-  </div>`;
-}}
-
-// Add user modal
-function show_add_user_modal() {{
-  show_user_modal(null);
-}}
-
-async function show_edit_user_modal(uuid) {{
-  const user = users_data.find(u => u.uuid === uuid);
-  if (!user) return;
-  show_user_modal(user);
-}}
-
-function show_user_modal(user) {{
-  const is_edit = !!user;
-  const overlay = document.createElement('div');
-  overlay.className = 'modal-overlay';
-  overlay.innerHTML = `
-  <div class="modal">
-    <div class="modal-header">
-      <div class="modal-title">${{is_edit ? '✏️ ویرایش کاربر' : '➕ کاربر جدید'}}</div>
-      <button class="modal-close" onclick="this.closest('.modal-overlay').remove()"><i class="fa fa-times"></i></button>
-    </div>
-    <div class="modal-body">
-      <div class="grid-2">
-        <div class="form-group">
-          <label>نام کاربر *</label>
-          <input id="m-name" type="text" value="${{user?.name||''}}" placeholder="Ali">
-        </div>
-        <div class="form-group">
-          <label>ایمیل</label>
-          <input id="m-email" type="email" value="${{user?.email||''}}" placeholder="ali@example.com">
-        </div>
-      </div>
-      <div class="grid-2">
-        <div class="form-group">
-          <label>حجم ترافیک (GB) — 0 = نامحدود</label>
-          <input id="m-traffic" type="number" value="${{user?.traffic_limit_gb||0}}" min="0" step="0.5">
-        </div>
-        <div class="form-group">
-          <label>مدت اشتراک (روز) — 0 = بدون انقضا</label>
-          <input id="m-expire" type="number" value="${{user?.expire_days||0}}" min="0">
-        </div>
-      </div>
-      <div class="grid-2">
-        <div class="form-group">
-          <label>حداکثر اتصال همزمان — 0 = نامحدود</label>
-          <input id="m-conn" type="number" value="${{user?.max_connections||0}}" min="0">
-        </div>
-        <div class="form-group">
-          <label>پرچم کشور (ایموجی)</label>
-          <input id="m-flag" type="text" value="${{user?.flag||''}}" placeholder="🇩🇪">
-        </div>
-      </div>
-      <div class="form-group">
-        <label>یادداشت</label>
-        <textarea id="m-note">${{user?.note||''}}</textarea>
-      </div>
-    </div>
-    <div class="modal-footer">
-      <button class="btn btn-secondary" onclick="this.closest('.modal-overlay').remove()">انصراف</button>
-      <button class="btn btn-primary" onclick="save_user('${{user?.uuid||''}}')">
-        <i class="fa fa-save"></i> ${{is_edit ? 'ذخیره' : 'ایجاد'}}
-      </button>
-    </div>
-  </div>`;
-  document.body.appendChild(overlay);
-}}
-
-async function save_user(uuid) {{
-  const data = {{
-    name: document.getElementById('m-name').value.trim(),
-    email: document.getElementById('m-email').value.trim(),
-    traffic_limit_gb: parseFloat(document.getElementById('m-traffic').value)||0,
-    expire_days: parseInt(document.getElementById('m-expire').value)||0,
-    max_connections: parseInt(document.getElementById('m-conn').value)||0,
-    flag: document.getElementById('m-flag').value.trim(),
-    note: document.getElementById('m-note').value.trim(),
-    is_active: 1,
-  }};
-  if (!data.name) {{ toast('نام الزامی است','error'); return; }}
-  try {{
-    if (uuid) {{ await api('PUT', `/api/users/${{uuid}}`, data); toast('کاربر ویرایش شد'); }}
-    else {{ await api('POST', '/api/users', data); toast('کاربر ایجاد شد'); }}
-    document.querySelector('.modal-overlay')?.remove();
-    await load_users();
-  }} catch(e) {{ toast(e.message,'error'); }}
-}}
-
-async function toggle_user(uuid, el) {{
-  try {{
-    await api('POST', `/api/users/${{uuid}}/toggle`);
-    toast(el.checked ? 'کاربر فعال شد' : 'کاربر غیرفعال شد');
-    await load_users();
-  }} catch(e) {{ toast(e.message,'error'); el.checked = !el.checked; }}
-}}
-
-async function reset_traffic(uuid, name) {{
-  if (!await confirm_dialog(`ترافیک ${{name}} ریست شود؟`)) return;
-  try {{
-    await api('POST', `/api/users/${{uuid}}/reset-traffic`);
-    toast('ترافیک ریست شد');
-    await load_users();
-  }} catch(e) {{ toast(e.message,'error'); }}
-}}
-
-async function delete_user(uuid, name) {{
-  if (!await confirm_dialog(`کاربر ${{name}} حذف شود؟`)) return;
-  try {{
-    await api('DELETE', `/api/users/${{uuid}}`);
-    toast('کاربر حذف شد');
-    await load_users();
-  }} catch(e) {{ toast(e.message,'error'); }}
-}}
-
-async function show_sub_link(uuid, name) {{
-  try {{
-    const data = await api('GET', `/api/users/${{uuid}}/sub-link`);
-    const overlay = document.createElement('div');
-    overlay.className = 'modal-overlay';
-    overlay.innerHTML = `
-    <div class="modal">
-      <div class="modal-header">
-        <div class="modal-title">🔗 لینک اشتراک — ${{name}}</div>
-        <button class="modal-close" onclick="this.closest('.modal-overlay').remove()"><i class="fa fa-times"></i></button>
-      </div>
-      <div class="modal-body">
-        <div class="form-group">
-          <label>لینک اشتراک (Subscription URL)</label>
-          <div class="code-block">
-            <span class="code-text">${{data.sub_link}}</span>
-            <button class="copy-btn" onclick="copy_text('${{data.sub_link}}')"><i class="fa fa-copy fa-lg"></i></button>
-          </div>
-        </div>
-        <div class="form-group">
-          <label>لینک VLESS مستقیم</label>
-          <div class="code-block">
-            <span class="code-text" style="font-size:11px;word-break:break-all">${{data.vless_link}}</span>
-            <button class="copy-btn" onclick="copy_text('${{data.vless_link}}')"><i class="fa fa-copy fa-lg"></i></button>
-          </div>
-        </div>
-        <div style="background:rgba(99,102,241,0.1);border:1px solid rgba(99,102,241,0.2);border-radius:8px;padding:12px;font-size:13px;color:var(--text2)">
-          <i class="fa fa-info-circle" style="color:var(--accent)"></i>
-          لینک اشتراک را در کلاینت‌هایی مثل v2rayNG، Nekobox یا هشت‌پا وارد کنید.
-        </div>
-      </div>
-      <div class="modal-footer">
-        <button class="btn btn-secondary" onclick="this.closest('.modal-overlay').remove()">بستن</button>
-        <button class="btn btn-primary" onclick="copy_text('${{data.sub_link}}')"><i class="fa fa-copy"></i> کپی لینک</button>
-      </div>
-    </div>`;
-    document.body.appendChild(overlay);
-  }} catch(e) {{ toast(e.message,'error'); }}
-}}
-
-// ─── IPs PAGE ──────────────────────────────────────────────────────────────
-async function render_ips() {{
-  const el = document.getElementById('page-ips');
-  el.innerHTML = `
-  <div class="card" style="margin-bottom:20px">
-    <div style="display:flex;gap:12px;flex-wrap:wrap">
-      <button class="btn btn-primary" onclick="show_add_ip_modal()"><i class="fa fa-plus"></i> افزودن IP</button>
-      <button class="btn btn-secondary" onclick="show_bulk_ip_modal()"><i class="fa fa-list"></i> افزودن انبوه</button>
-    </div>
-  </div>
-  <div class="card">
-    <div class="card-title"><i class="fa fa-network-wired" style="color:var(--blue)"></i> IP های ثبت شده</div>
-    <div id="ips-table-wrapper"><div style="text-align:center;padding:40px;color:var(--text2)"><i class="fa fa-spinner spin fa-2x"></i></div></div>
-  </div>`;
-  await load_ips();
-}}
-
-async function load_ips() {{
-  try {{
-    ips_data = await api('GET', '/api/ips');
-    render_ips_table();
-  }} catch(e) {{ toast(e.message,'error'); }}
-}}
-
-function render_ips_table() {{
-  const el = document.getElementById('ips-table-wrapper');
-  if (!el) return;
-  if (ips_data.length === 0) {{
-    el.innerHTML = `<div class="empty-state"><div class="empty-icon">🌐</div><h3>IP ای وجود ندارد</h3><p>IP های تمیز اضافه کنید تا در لینک‌های اشتراک استفاده شوند</p></div>`;
-    return;
-  }}
-  el.innerHTML = `
-  <div class="table-wrapper">
-  <table>
-    <thead><tr><th>آدرس IP</th><th>برچسب</th><th>تاریخ افزوده</th><th>وضعیت</th><th>عملیات</th></tr></thead>
-    <tbody>
-      ${{ips_data.map(ip => `<tr>
-        <td><span class="ip-chip">${{ip.ip}}</span></td>
-        <td>${{ip.label || '<span style="color:var(--text3)">—</span>'}}</td>
-        <td>${{format_date(ip.added_at)}}</td>
-        <td><label class="toggle"><input type="checkbox" ${{ip.is_active?'checked':''}} onchange="toggle_ip(${{ip.id}},this)"><span class="toggle-slider"></span></label></td>
-        <td>
-          <div style="display:flex;gap:6px">
-            <button class="btn btn-secondary btn-sm" onclick="copy_text('${{ip.ip}}')" title="کپی"><i class="fa fa-copy"></i></button>
-            <button class="btn btn-danger btn-sm" onclick="delete_ip(${{ip.id}},'${{ip.ip}}')" title="حذف"><i class="fa fa-trash"></i></button>
-          </div>
-        </td>
-      </tr>`).join('')}}
-    </tbody>
-  </table>
-  </div>`;
-}}
-
-function show_add_ip_modal() {{
-  const overlay = document.createElement('div');
-  overlay.className = 'modal-overlay';
-  overlay.innerHTML = `
-  <div class="modal">
-    <div class="modal-header">
-      <div class="modal-title">➕ افزودن IP تمیز</div>
-      <button class="modal-close" onclick="this.closest('.modal-overlay').remove()"><i class="fa fa-times"></i></button>
-    </div>
-    <div class="modal-body">
-      <div class="form-group"><label>آدرس IP *</label><input id="ip-addr" type="text" placeholder="1.2.3.4" dir="ltr"></div>
-      <div class="form-group"><label>برچسب (اختیاری)</label><input id="ip-label" type="text" placeholder="فرانکفورت"></div>
-    </div>
-    <div class="modal-footer">
-      <button class="btn btn-secondary" onclick="this.closest('.modal-overlay').remove()">انصراف</button>
-      <button class="btn btn-primary" onclick="add_ip()"><i class="fa fa-save"></i> ذخیره</button>
-    </div>
-  </div>`;
-  document.body.appendChild(overlay);
-}}
-
-async function add_ip() {{
-  const ip = document.getElementById('ip-addr')?.value?.trim();
-  const label = document.getElementById('ip-label')?.value?.trim() || '';
-  if (!ip) {{ toast('IP الزامی است','error'); return; }}
-  try {{
-    await api('POST', '/api/ips', {{ip, label}});
-    toast('IP اضافه شد');
-    document.querySelector('.modal-overlay')?.remove();
-    await load_ips();
-  }} catch(e) {{ toast(e.message,'error'); }}
-}}
-
-function show_bulk_ip_modal() {{
-  const overlay = document.createElement('div');
-  overlay.className = 'modal-overlay';
-  overlay.innerHTML = `
-  <div class="modal">
-    <div class="modal-header">
-      <div class="modal-title">📋 افزودن انبوه IP</div>
-      <button class="modal-close" onclick="this.closest('.modal-overlay').remove()"><i class="fa fa-times"></i></button>
-    </div>
-    <div class="modal-body">
-      <div class="form-group">
-        <label>IP ها (هر خط یک IP)</label>
-        <textarea id="bulk-ips" placeholder="1.2.3.4 آلمان&#10;5.6.7.8 هلند&#10;9.10.11.12" style="min-height:150px;direction:ltr"></textarea>
-        <small style="color:var(--text3);font-size:12px;margin-top:4px;display:block">فرمت: IP فضا برچسب (برچسب اختیاری است)</small>
-      </div>
-    </div>
-    <div class="modal-footer">
-      <button class="btn btn-secondary" onclick="this.closest('.modal-overlay').remove()">انصراف</button>
-      <button class="btn btn-primary" onclick="bulk_add_ips()"><i class="fa fa-upload"></i> افزودن همه</button>
-    </div>
-  </div>`;
-  document.body.appendChild(overlay);
-}}
-
-async function bulk_add_ips() {{
-  const ips = document.getElementById('bulk-ips')?.value || '';
-  try {{
-    const r = await api('POST', '/api/ips/bulk', {{ips}});
-    toast(`${{r.added}} IP اضافه شد`);
-    document.querySelector('.modal-overlay')?.remove();
-    await load_ips();
-  }} catch(e) {{ toast(e.message,'error'); }}
-}}
-
-async function toggle_ip(id, el) {{
-  try {{
-    await api('POST', `/api/ips/${{id}}/toggle`);
-    toast(el.checked ? 'IP فعال شد' : 'IP غیرفعال شد');
-    await load_ips();
-  }} catch(e) {{ toast(e.message,'error'); el.checked = !el.checked; }}
-}}
-
-async function delete_ip(id, ip) {{
-  if (!await confirm_dialog(`IP ${{ip}} حذف شود؟`)) return;
-  try {{
-    await api('DELETE', `/api/ips/${{id}}`);
-    toast('IP حذف شد');
-    await load_ips();
-  }} catch(e) {{ toast(e.message,'error'); }}
-}}
-
-// ─── SETTINGS PAGE ──────────────────────────────────────────────────────────
-async function render_settings() {{
-  const el = document.getElementById('page-settings');
-  el.innerHTML = `<div style="text-align:center;padding:40px;color:var(--text2)"><i class="fa fa-spinner spin fa-2x"></i></div>`;
-  
-  try {{
-    const s = await api('GET', '/api/settings');
-    
-    el.innerHTML = `
-    <div class="grid-2">
-      <div>
-        <div class="card">
-          <div class="card-title"><i class="fa fa-sliders-h" style="color:var(--accent)"></i> تنظیمات پنل</div>
-          <div class="form-group"><label>عنوان پنل</label><input id="s-title" value="${{s.panel_title||'XRay Panel'}}"></div>
-        </div>
-        
-        <div class="card">
-          <div class="card-title"><i class="fa fa-network-wired" style="color:var(--blue)"></i> تنظیمات اتصال</div>
-          <div class="form-group"><label>مسیر WebSocket</label><input id="s-wspath" value="${{s.ws_path||'/vless-ws'}}" dir="ltr"></div>
-          <div class="form-group"><label>دامنه (DOMAIN)</label><input id="s-domain" value="${{s.sni||''}}" dir="ltr" placeholder="example.com"></div>
-          <div class="form-group"><label>Host Header</label><input id="s-host" value="${{s.host_header||''}}" dir="ltr"></div>
-          <div class="form-group"><label>TLS Fingerprint</label>
-            <select id="s-fp">
-              ${{['chrome','firefox','safari','ios','android','edge','360','qq'].map(v=>`<option value="${{v}}" ${{s.tls_fingerprint===v?'selected':''}}>${{v}}</option>`).join('')}}
-            </select>
-          </div>
-          <div class="form-group"><label>Fragment (اختیاری)</label><input id="s-fragment" value="${{s.fragment||''}}" dir="ltr" placeholder="100-200"></div>
-        </div>
-        
-        <div class="card">
-          <div class="card-title"><i class="fa fa-heartbeat" style="color:var(--green)"></i> Keep-Alive</div>
-          <div class="form-group" style="display:flex;align-items:center;justify-content:space-between">
-            <label style="margin:0">فعال‌سازی Keep-Alive</label>
-            <label class="toggle"><input id="s-ka" type="checkbox" ${{s.keepalive_enabled==='1'?'checked':''}}><span class="toggle-slider"></span></label>
-          </div>
-          <div class="form-group"><label>فاصله زمانی (ثانیه)</label><input id="s-kai" type="number" value="${{s.keepalive_interval||300}}" min="60"></div>
-          <div class="form-group"><label>حالت</label>
-            <select id="s-kam">
-              <option value="simple" ${{s.keepalive_mode==='simple'?'selected':''}}>Simple</option>
-              <option value="advanced" ${{s.keepalive_mode==='advanced'?'selected':''}}>Advanced</option>
-            </select>
-          </div>
-        </div>
-      </div>
-      
-      <div>
-        <div class="card">
-          <div class="card-title"><i class="fa fa-paper-plane" style="color:var(--yellow)"></i> ربات تلگرام</div>
-          <div class="form-group" style="display:flex;align-items:center;justify-content:space-between">
-            <label style="margin:0">ارسال نوتیفیکیشن</label>
-            <label class="toggle"><input id="s-tg" type="checkbox" ${{s.tg_enabled==='1'?'checked':''}}><span class="toggle-slider"></span></label>
-          </div>
-          <div class="form-group"><label>توکن ربات</label><input id="s-tgtoken" value="${{s.tg_bot_token||''}}" dir="ltr" placeholder="123456:ABC..."></div>
-          <div class="form-group"><label>Chat ID</label><input id="s-tgchat" value="${{s.tg_chat_id||''}}" dir="ltr" placeholder="-100..."></div>
-          <div class="form-group"><label>زبان پیام‌ها</label>
-            <select id="s-tglang">
-              <option value="fa" ${{s.tg_lang==='fa'?'selected':''}}>فارسی</option>
-              <option value="en" ${{s.tg_lang==='en'?'selected':''}}>English</option>
-            </select>
-          </div>
-          <button class="btn btn-secondary" onclick="test_telegram()"><i class="fa fa-paper-plane"></i> تست ارسال</button>
-        </div>
-        
-        <div class="card">
-          <div class="card-title"><i class="fa fa-info-circle" style="color:var(--text2)"></i> اطلاعات سیستم</div>
-          <div style="display:grid;gap:12px">
-            <div style="background:var(--bg3);padding:12px;border-radius:8px;font-size:13px">
-              <span style="color:var(--text2)">نسخه پنل: </span><span style="color:var(--accent2);font-weight:600">v{PANEL_VERSION}</span>
-            </div>
-            <div style="background:var(--bg3);padding:12px;border-radius:8px;font-size:13px">
-              <span style="color:var(--text2)">دامنه: </span><code style="color:var(--accent3)">{DOMAIN}</code>
-            </div>
-            <div style="background:var(--bg3);padding:12px;border-radius:8px;font-size:13px">
-              <span style="color:var(--text2)">پروتکل: </span><span>VLESS + WS + TLS</span>
-            </div>
-          </div>
-        </div>
-        
-        <button class="btn btn-primary" onclick="save_settings()" style="width:100%">
-          <i class="fa fa-save"></i> ذخیره تنظیمات
-        </button>
-      </div>
-    </div>`;
-  }} catch(e) {{
-    el.innerHTML = `<div class="card"><p style="color:var(--red)">${{e.message}}</p></div>`;
-  }}
-}}
-
-async function save_settings() {{
-  try {{
-    await api('POST', '/api/settings', {{
-      panel_title: document.getElementById('s-title')?.value,
-      ws_path: document.getElementById('s-wspath')?.value,
-      sni: document.getElementById('s-domain')?.value,
-      host_header: document.getElementById('s-host')?.value,
-      tls_fingerprint: document.getElementById('s-fp')?.value,
-      fragment: document.getElementById('s-fragment')?.value,
-      keepalive_enabled: document.getElementById('s-ka')?.checked ? '1' : '0',
-      keepalive_interval: document.getElementById('s-kai')?.value,
-      keepalive_mode: document.getElementById('s-kam')?.value,
-      tg_enabled: document.getElementById('s-tg')?.checked ? '1' : '0',
-      tg_bot_token: document.getElementById('s-tgtoken')?.value,
-      tg_chat_id: document.getElementById('s-tgchat')?.value,
-      tg_lang: document.getElementById('s-tglang')?.value,
-    }});
-    toast('تنظیمات ذخیره شد ✓');
-  }} catch(e) {{ toast(e.message,'error'); }}
-}}
-
-async function test_telegram() {{
-  try {{
-    await save_settings();
-    await api('POST', '/api/settings', {{tg_enabled: '1'}});
-    await fetch('/api/stats'); // trigger a ping
-    toast('پیام تست ارسال شد (اگر توکن صحیح باشد)');
-  }} catch(e) {{ toast(e.message,'error'); }}
-}}
-
-// ─── INIT ─────────────────────────────────────────────────────────────────
-if (IS_AUTH) {{ render_app(); }}
-else {{ render_login(); }}
+// ══════════════════════════════════════════════════════
+//  INIT
+// ══════════════════════════════════════════════════════
+if(IS_AUTH) renderApp();
+else renderLogin();
 </script>
 </body>
 </html>"""
