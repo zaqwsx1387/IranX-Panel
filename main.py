@@ -41,7 +41,7 @@ from fastapi.staticfiles import StaticFiles
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
-PANEL_VERSION = "1.0.0"
+PANEL_VERSION = "2.0.0"
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "Admin@12345")
 SECRET_KEY = os.environ.get("SECRET_KEY", secrets.token_hex(32))
@@ -113,7 +113,7 @@ async def init_db():
 
         # Default settings
         defaults = {
-            "panel_title": "XRay Panel",
+            "panel_title": "IranX-Panel",
             "ws_path": "/vless-ws",
             "sni": DOMAIN,
             "host_header": DOMAIN,
@@ -280,7 +280,13 @@ async def build_subscription(user_uuid: str) -> str:
         for ip_row in ips:
             ip_addr = ip_row["ip"]
             ip_label = ip_row["label"] or ip_addr
-            display_name = f"{user['flag']} {user['name']} | {ip_label}".strip()
+            # Include remaining traffic in label (option C)
+            limit_bytes = float(user["traffic_limit_gb"] or 0) * 1024 ** 3
+            used_bytes = int(user["used_traffic_bytes"] or 0)
+            remaining_bytes = max(0, int(limit_bytes - used_bytes)) if limit_bytes > 0 else 0
+            remaining_gb = round(remaining_bytes / 1024 ** 3, 2) if limit_bytes > 0 else 0
+            remaining_txt = f"{remaining_gb}GB" if limit_bytes > 0 else "∞"
+            display_name = f"{user['flag']} {user['name']} | {remaining_txt} left | {ip_label}".strip()
             link = await build_vless_link(
                 user["uuid"],
                 display_name,
@@ -288,12 +294,51 @@ async def build_subscription(user_uuid: str) -> str:
             )
             links.append(link)
     else:
-        # بدون IP تمیز — از دامنه اصلی استفاده کن
-        link = await build_vless_link(user["uuid"], user["name"], user["flag"])
+        # بدون IP تمیز — از دامنه اصلی استفاده کن (با نمایش حجم باقی‌مانده در لیبل)
+        limit_bytes = float(user["traffic_limit_gb"] or 0) * 1024 ** 3
+        used_bytes = int(user["used_traffic_bytes"] or 0)
+        remaining_bytes = max(0, int(limit_bytes - used_bytes)) if limit_bytes > 0 else 0
+        remaining_gb = round(remaining_bytes / 1024 ** 3, 2) if limit_bytes > 0 else 0
+        remaining_txt = f"{remaining_gb}GB" if limit_bytes > 0 else "∞"
+        display_name = f"{user['flag']} {user['name']} | {remaining_txt} left".strip()
+        link = await build_vless_link(user["uuid"], display_name, "")
         links.append(link)
 
     content = "\n".join(links)
     return base64.b64encode(content.encode()).decode()
+
+async def build_subscription_userinfo_header(user_uuid: str) -> str:
+    """Build Clash/Sing-box compatible Subscription-Userinfo header.
+
+    Format: upload=<bytes>; download=<bytes>; total=<bytes>; expire=<unix_ts>
+    We don't track upload/download separately in this panel, so we report used as download.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT used_traffic_bytes, traffic_limit_gb, expire_at FROM users WHERE uuid=?",
+            (user_uuid,),
+        ) as cur:
+            u = await cur.fetchone()
+
+    if not u:
+        return "upload=0; download=0; total=0; expire=0"
+
+    used = int(u["used_traffic_bytes"] or 0)
+    limit_gb = float(u["traffic_limit_gb"] or 0)
+    total = int(limit_gb * 1024 ** 3) if limit_gb > 0 else 0
+
+    expire_ts = 0
+    if u["expire_at"]:
+        try:
+            expire_dt = datetime.fromisoformat(u["expire_at"])
+            expire_ts = int(expire_dt.replace(tzinfo=timezone.utc).timestamp()) if expire_dt.tzinfo is None else int(expire_dt.timestamp())
+        except Exception:
+            expire_ts = 0
+
+    # We only track aggregate bytes, so map it to download.
+    return f"upload=0; download={used}; total={total}; expire={expire_ts}"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # KEEP-ALIVE
@@ -362,7 +407,7 @@ async def lifespan(app: FastAPI):
 # ─────────────────────────────────────────────────────────────────────────────
 # APP
 # ─────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="XRay Panel", lifespan=lifespan)
+app = FastAPI(title="IranX-Panel", lifespan=lifespan)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ROUTES – PUBLIC
@@ -585,12 +630,13 @@ async def subscription(user_uuid: str):
     content = await build_subscription(user_uuid)
     if not content:
         raise HTTPException(status_code=404, detail="User not found or expired")
+    userinfo = await build_subscription_userinfo_header(user_uuid)
     return PlainTextResponse(
         content,
         headers={
             "Content-Type": "text/plain; charset=utf-8",
             "Profile-Update-Interval": "6",
-            "Subscription-Userinfo": "upload=0; download=0; total=0; expire=0",
+            "Subscription-Userinfo": userinfo,
         },
     )
 
@@ -759,7 +805,15 @@ async def get_sub_link(user_uuid: str, auth=Depends(require_auth)):
     if not user:
         raise HTTPException(404, "کاربر یافت نشد")
 
-    vless = await build_vless_link(user["uuid"], user["name"], user["flag"])
+    # Option C: include remaining traffic in label
+    limit_bytes = float(user["traffic_limit_gb"] or 0) * 1024 ** 3
+    used_bytes = int(user["used_traffic_bytes"] or 0)
+    remaining_bytes = max(0, int(limit_bytes - used_bytes)) if limit_bytes > 0 else 0
+    remaining_gb = round(remaining_bytes / 1024 ** 3, 2) if limit_bytes > 0 else 0
+    remaining_txt = f"{remaining_gb}GB" if limit_bytes > 0 else "∞"
+
+    vless_label = f"{user['flag']} {user['name']} | {remaining_txt} left".strip()
+    vless = await build_vless_link(user["uuid"], vless_label, "")
 
     # لینک‌های IP تمیز (اگه وجود داشت)
     async with aiosqlite.connect(DB_PATH) as db:
@@ -769,9 +823,10 @@ async def get_sub_link(user_uuid: str, auth=Depends(require_auth)):
 
     ip_links = []
     for ip_row in ips:
+        ip_lbl = (ip_row['label'] or ip_row['ip'])
         lnk = await build_vless_link(
             user["uuid"],
-            f"{user['name']} | {ip_row['label'] or ip_row['ip']}",
+            f"{user['name']} | {remaining_txt} left | {ip_lbl}",
             user["flag"],
             address=ip_row["ip"],
         )
@@ -945,7 +1000,7 @@ def get_html(is_auth: bool) -> str:
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>XRay Panel</title>
+<title>IranX-Panel</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
@@ -953,31 +1008,37 @@ def get_html(is_auth: bool) -> str:
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
   :root {{
-    --bg: #0f1117;
-    --bg2: #161b27;
-    --bg3: #1e2538;
-    --card: #1a2035;
-    --border: #2a3555;
-    --accent: #6366f1;
-    --accent2: #818cf8;
-    --accent3: #a5b4fc;
+    /* Minimal, pro palette (cool slate + electric cyan) */
+    --bg: #0b0f17;
+    --bg2: #0f1626;
+    --bg3: #111b30;
+    --card: rgba(255,255,255,0.04);
+    --card2: rgba(255,255,255,0.06);
+    --border: rgba(148,163,184,0.18);
+    --border2: rgba(148,163,184,0.28);
+    --accent: #22d3ee;
+    --accent2: #60a5fa;
+    --accent3: #a78bfa;
     --green: #10b981;
-    --red: #ef4444;
-    --yellow: #f59e0b;
-    --blue: #3b82f6;
-    --text: #e2e8f0;
-    --text2: #94a3b8;
-    --text3: #64748b;
-    --shadow: 0 4px 24px rgba(0,0,0,0.4);
-    --radius: 14px;
-    --radius-sm: 8px;
+    --red: #fb7185;
+    --yellow: #fbbf24;
+    --blue: #60a5fa;
+    --text: rgba(248,250,252,0.92);
+    --text2: rgba(226,232,240,0.72);
+    --text3: rgba(148,163,184,0.65);
+    --shadow: 0 10px 40px rgba(0,0,0,0.45);
+    --radius: 16px;
+    --radius-sm: 12px;
   }}
 
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
   
   body {{
-    font-family: 'Vazirmatn', sans-serif;
-    background: var(--bg);
+    font-family: 'Vazirmatn', system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    background: radial-gradient(1200px 900px at 15% 10%, rgba(34,211,238,0.12), transparent 55%),
+                radial-gradient(900px 700px at 85% 20%, rgba(96,165,250,0.10), transparent 55%),
+                radial-gradient(900px 700px at 40% 95%, rgba(167,139,250,0.08), transparent 55%),
+                var(--bg);
     color: var(--text);
     min-height: 100vh;
     direction: rtl;
@@ -995,7 +1056,7 @@ def get_html(is_auth: bool) -> str:
     align-items: center;
     justify-content: center;
     min-height: 100vh;
-    background: var(--bg);
+    background: transparent;
     position: relative;
     overflow: hidden;
   }}
@@ -1003,7 +1064,7 @@ def get_html(is_auth: bool) -> str:
     content: '';
     position: absolute;
     width: 600px; height: 600px;
-    background: radial-gradient(circle, rgba(99,102,241,0.15) 0%, transparent 70%);
+    background: radial-gradient(circle, rgba(34,211,238,0.16) 0%, transparent 70%);
     top: -100px; right: -100px;
     pointer-events: none;
   }}
@@ -1040,7 +1101,7 @@ def get_html(is_auth: bool) -> str:
     justify-content: center;
     font-size: 32px;
     margin-bottom: 16px;
-    box-shadow: 0 8px 32px rgba(99,102,241,0.3);
+    box-shadow: 0 10px 40px rgba(34,211,238,0.18);
   }}
   .login-logo h1 {{ font-size: 24px; font-weight: 700; color: var(--text); }}
   .login-logo p {{ color: var(--text2); font-size: 14px; margin-top: 4px; }}
@@ -1064,7 +1125,7 @@ def get_html(is_auth: bool) -> str:
   }}
   .form-group input:focus, .form-group select:focus, .form-group textarea:focus {{
     border-color: var(--accent);
-    box-shadow: 0 0 0 3px rgba(99,102,241,0.15);
+    box-shadow: 0 0 0 3px rgba(34,211,238,0.16);
   }}
   .form-group textarea {{ resize: vertical; min-height: 80px; }}
   .form-group select option {{ background: var(--bg2); }}
@@ -1085,11 +1146,12 @@ def get_html(is_auth: bool) -> str:
     text-decoration: none;
   }}
   .btn-primary {{
-    background: linear-gradient(135deg, var(--accent), #4f46e5);
-    color: white;
-    box-shadow: 0 4px 16px rgba(99,102,241,0.3);
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    color: rgba(3,7,18,0.92);
+    box-shadow: 0 10px 26px rgba(34,211,238,0.18);
+    border: 1px solid rgba(34,211,238,0.22);
   }}
-  .btn-primary:hover {{ transform: translateY(-1px); box-shadow: 0 6px 20px rgba(99,102,241,0.4); }}
+  .btn-primary:hover {{ transform: translateY(-1px); box-shadow: 0 14px 34px rgba(34,211,238,0.22); }}
   .btn-success {{ background: rgba(16,185,129,0.15); color: var(--green); border: 1px solid rgba(16,185,129,0.3); }}
   .btn-success:hover {{ background: rgba(16,185,129,0.25); }}
   .btn-danger {{ background: rgba(239,68,68,0.15); color: var(--red); border: 1px solid rgba(239,68,68,0.3); }}
@@ -1164,7 +1226,7 @@ def get_html(is_auth: bool) -> str:
     user-select: none;
   }}
   .nav-item:hover {{ background: var(--bg3); color: var(--text); }}
-  .nav-item.active {{ background: rgba(99,102,241,0.15); color: var(--accent2); }}
+  .nav-item.active {{ background: rgba(34,211,238,0.12); color: var(--accent); border: 1px solid rgba(34,211,238,0.18); }}
   .nav-item .nav-icon {{ width: 20px; text-align: center; font-size: 15px; }}
   
   .sidebar-footer {{
@@ -1284,11 +1346,11 @@ def get_html(is_auth: bool) -> str:
     font-size: 22px;
     margin-bottom: 16px;
   }}
-  .stat-icon.accent {{ background: rgba(99,102,241,0.15); color: var(--accent2); }}
-  .stat-icon.green {{ background: rgba(16,185,129,0.15); color: var(--green); }}
-  .stat-icon.red {{ background: rgba(239,68,68,0.15); color: var(--red); }}
-  .stat-icon.yellow {{ background: rgba(245,158,11,0.15); color: var(--yellow); }}
-  .stat-icon.blue {{ background: rgba(59,130,246,0.15); color: var(--blue); }}
+  .stat-icon.accent {{ background: rgba(34,211,238,0.14); color: var(--accent); }}
+  .stat-icon.green {{ background: rgba(16,185,129,0.14); color: var(--green); }}
+  .stat-icon.red {{ background: rgba(251,113,133,0.14); color: var(--red); }}
+  .stat-icon.yellow {{ background: rgba(251,191,36,0.14); color: var(--yellow); }}
+  .stat-icon.blue {{ background: rgba(96,165,250,0.14); color: var(--blue); }}
   
   .stat-value {{ font-size: 32px; font-weight: 800; color: var(--text); line-height: 1; }}
   .stat-label {{ font-size: 13px; color: var(--text2); margin-top: 6px; font-weight: 500; }}
@@ -1331,8 +1393,8 @@ def get_html(is_auth: bool) -> str:
   .badge-green {{ background: rgba(16,185,129,0.15); color: var(--green); }}
   .badge-red {{ background: rgba(239,68,68,0.15); color: var(--red); }}
   .badge-yellow {{ background: rgba(245,158,11,0.15); color: var(--yellow); }}
-  .badge-blue {{ background: rgba(59,130,246,0.15); color: var(--blue); }}
-  .badge-purple {{ background: rgba(99,102,241,0.15); color: var(--accent2); }}
+  .badge-blue {{ background: rgba(96,165,250,0.14); color: var(--blue); }}
+  .badge-purple {{ background: rgba(167,139,250,0.14); color: var(--accent3); }}
   
   /* PROGRESS */
   .progress {{
