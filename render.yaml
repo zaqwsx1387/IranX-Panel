@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: xray-panel
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    disk:
+      name: panel-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: ADMIN_USERNAME
+        value: admin
+      - key: ADMIN_PASSWORD
+        generateValue: false
+      - key: SECRET_KEY
+        generateValue: true
+      - key: DOMAIN
+        value: your-app.up.railway.app
+      - key: DB_PATH
+        value: /data/panel.db

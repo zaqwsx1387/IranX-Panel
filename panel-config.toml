@@ -1,0 +1,37 @@
+# XRay Panel Configuration
+# This file is for reference only. Set actual values as environment variables.
+
+[panel]
+title = "XRay Panel"
+version = "1.0.0"
+
+[server]
+port = 8000
+domain = "your-domain.up.railway.app"
+db_path = "/data/panel.db"
+
+[auth]
+# Set via environment variable: ADMIN_USERNAME
+admin_username = "admin"
+# Set via environment variable: ADMIN_PASSWORD (min 8 chars)
+admin_password = "Admin@12345"
+# Set via environment variable: SECRET_KEY
+secret_key = "change-me-to-random-string"
+
+[vless]
+ws_path = "/vless-ws"
+tls_fingerprint = "chrome"
+fragment = ""
+
+[telegram]
+enabled = false
+# Set via environment variable: TG_BOT_TOKEN
+bot_token = ""
+# Set via environment variable: TG_CHAT_ID
+chat_id = ""
+lang = "fa"
+
+[keepalive]
+enabled = false
+interval_seconds = 300
+mode = "simple"
