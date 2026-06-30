@@ -3,7 +3,7 @@ services:
     name: xray-panel
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    startCommand: sh -c 'uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}'
     disk:
       name: panel-data
       mountPath: /data
