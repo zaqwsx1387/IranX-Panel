@@ -205,7 +205,12 @@ async def send_telegram(message: str):
 # ─────────────────────────────────────────────────────────────────────────────
 # SUBSCRIPTION LINK BUILDER
 # ─────────────────────────────────────────────────────────────────────────────
-async def build_vless_link(user_uuid: str, user_name: str, flag: str = "") -> str:
+async def build_vless_link(
+    user_uuid: str,
+    user_name: str,
+    flag: str = "",
+    address: str = None,
+) -> str:
     from urllib.parse import quote
     domain = DOMAIN
     sni = await get_setting("sni", domain)
@@ -213,8 +218,11 @@ async def build_vless_link(user_uuid: str, user_name: str, flag: str = "") -> st
     fp = await get_setting("tls_fingerprint", "chrome")
     fragment = await get_setting("fragment", "")
 
-    # Per-user unique path — same as SulgX style
+    # Per-user unique path
     ws_path = f"/ws/{user_uuid}"
+
+    # اگه IP تمیز داده شده، آدرس اتصال عوض میشه ولی SNI و host ثابت میمونه
+    connect_addr = address if address else domain
 
     params = {
         "encryption": "none",
@@ -231,10 +239,13 @@ async def build_vless_link(user_uuid: str, user_name: str, flag: str = "") -> st
 
     query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
     label = f"{flag} {user_name}".strip() if flag else user_name
-    return f"vless://{user_uuid}@{domain}:443?{query}#{quote(label)}"
+    return f"vless://{user_uuid}@{connect_addr}:443?{query}#{quote(label)}"
 
 
 async def build_subscription(user_uuid: str) -> str:
+    import base64
+    from urllib.parse import quote
+
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
@@ -255,30 +266,32 @@ async def build_subscription(user_uuid: str) -> str:
     if limit_bytes > 0 and user["used_traffic_bytes"] >= limit_bytes:
         return ""
 
-    # Get clean IPs
-    links = []
+    # Get active clean IPs
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT ip, label FROM clean_ips WHERE is_active=1"
+            "SELECT ip, label FROM clean_ips WHERE is_active=1 ORDER BY id"
         ) as cur:
             ips = await cur.fetchall()
 
+    links = []
     if ips:
+        # یه لینک برای هر IP تمیز — آدرس اتصال IP هست، SNI/host همون دامنه اصلی
         for ip_row in ips:
-            label = ip_row["label"] or ip_row["ip"]
+            ip_addr = ip_row["ip"]
+            ip_label = ip_row["label"] or ip_addr
+            display_name = f"{user['flag']} {user['name']} | {ip_label}".strip()
             link = await build_vless_link(
-                user["uuid"], label, user["flag"]
+                user["uuid"],
+                display_name,
+                address=ip_addr,
             )
-            # Override IP in link
-            domain = DOMAIN
-            link = link.replace(f"@{domain}:", f"@{ip_row['ip']}:")
             links.append(link)
     else:
+        # بدون IP تمیز — از دامنه اصلی استفاده کن
         link = await build_vless_link(user["uuid"], user["name"], user["flag"])
         links.append(link)
 
-    import base64
     content = "\n".join(links)
     return base64.b64encode(content.encode()).decode()
 
@@ -734,10 +747,41 @@ async def toggle_user(user_uuid: str, auth=Depends(require_auth)):
 
 @app.get("/api/users/{user_uuid}/sub-link")
 async def get_sub_link(user_uuid: str, auth=Depends(require_auth)):
+    from urllib.parse import quote
     scheme = "https" if DOMAIN != "localhost:8000" else "http"
-    link = f"{scheme}://{DOMAIN}/sub/{user_uuid}"
-    vless_link = await build_vless_link(user_uuid, user_uuid)
-    return {"sub_link": link, "vless_link": vless_link}
+    sub_url = f"{scheme}://{DOMAIN}/sub/{user_uuid}"
+
+    # لینک VLESS مستقیم — بدون IP تمیز
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM users WHERE uuid=?", (user_uuid,)) as cur:
+            user = await cur.fetchone()
+    if not user:
+        raise HTTPException(404, "کاربر یافت نشد")
+
+    vless = await build_vless_link(user["uuid"], user["name"], user["flag"])
+
+    # لینک‌های IP تمیز (اگه وجود داشت)
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT ip, label FROM clean_ips WHERE is_active=1") as cur:
+            ips = await cur.fetchall()
+
+    ip_links = []
+    for ip_row in ips:
+        lnk = await build_vless_link(
+            user["uuid"],
+            f"{user['name']} | {ip_row['label'] or ip_row['ip']}",
+            user["flag"],
+            address=ip_row["ip"],
+        )
+        ip_links.append({"ip": ip_row["ip"], "label": ip_row["label"], "link": lnk})
+
+    return {
+        "sub_link": sub_url,
+        "vless_link": vless,
+        "ip_links": ip_links,
+    }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ROUTES – CLEAN IPs
