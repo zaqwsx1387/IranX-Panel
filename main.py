@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════╗
-║           XRay Panel - Powered by FastAPI + SQLite       ║
+║           IranX Panel - Powered by FastAPI + SQLite       ║
 ║           VLESS + WS + TLS Subscription Manager          ║
 ║           Telegram Notifications | Clean IP Manager      ║
 ╚══════════════════════════════════════════════════════════╝
@@ -55,7 +55,7 @@ TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 os.makedirs(os.path.dirname(DB_PATH) if os.path.dirname(DB_PATH) else ".", exist_ok=True)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("xray-panel")
+log = logging.getLogger("iranx-panel")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DATABASE
@@ -89,6 +89,7 @@ async def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ip TEXT UNIQUE NOT NULL,
                 label TEXT DEFAULT '',
+                type TEXT DEFAULT 'ip',
                 is_active INTEGER DEFAULT 1,
                 added_at TEXT NOT NULL
             );
@@ -111,6 +112,15 @@ async def init_db():
             );
         """)
 
+        # Migration: add `type` column to clean_ips for older databases
+        try:
+            await db.execute("ALTER TABLE clean_ips ADD COLUMN type TEXT DEFAULT 'ip'")
+            await db.commit()
+        except Exception:
+            pass
+
+        # Migration: add `admin_password_hash` / `admin_username_custom` support handled via settings defaults below
+
         # Default settings
         defaults = {
             "panel_title": "IranX-Panel",
@@ -127,6 +137,9 @@ async def init_db():
             "tg_chat_id": TG_CHAT_ID,
             "tg_lang": "fa",
             "fake_info_config": "1",
+            "admin_password_hash": "",
+            "admin_username_custom": "",
+            "ui_theme": "dark",
         }
         for k, v in defaults.items():
             await db.execute(
@@ -184,6 +197,22 @@ def require_auth(session: Optional[str] = Cookie(None)):
     if not session or not verify_token(session):
         raise HTTPException(status_code=401, detail="Unauthorized")
     return True
+
+
+def hash_password(password: str) -> str:
+    return hashlib.sha256(f"{password}:{SECRET_KEY}".encode()).hexdigest()
+
+
+async def get_effective_admin_username() -> str:
+    custom = await get_setting("admin_username_custom", "")
+    return custom or ADMIN_USERNAME
+
+
+async def verify_admin_password(password: str) -> bool:
+    stored_hash = await get_setting("admin_password_hash", "")
+    if stored_hash:
+        return hmac.compare_digest(hash_password(password), stored_hash)
+    return password == ADMIN_PASSWORD
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TELEGRAM
@@ -243,47 +272,47 @@ async def build_vless_link(
     return f"vless://{user_uuid}@{connect_addr}:443?{query}#{quote(label)}"
 
 
-def _fmt_remaining_traffic(user) -> str:
+def _fmt_remaining_traffic_en(user) -> str:
     limit_bytes = float(user["traffic_limit_gb"] or 0) * 1024 ** 3
     used_bytes = int(user["used_traffic_bytes"] or 0)
     if limit_bytes <= 0:
-        return "نامحدود"
+        return "Unlimited"
     remaining_bytes = max(0, int(limit_bytes - used_bytes))
     remaining_gb = remaining_bytes / 1024 ** 3
     if remaining_gb >= 1:
-        return f"{round(remaining_gb, 2)} GB"
-    return f"{round(remaining_bytes / 1024 ** 2)} MB"
+        return f"{round(remaining_gb, 2)}GB"
+    return f"{round(remaining_bytes / 1024 ** 2)}MB"
 
 
-def _fmt_remaining_days(user) -> str:
+def _fmt_remaining_days_en(user) -> str:
     if not user["expire_at"]:
-        return "نامحدود"
+        return "Unlimited"
     try:
         exp = datetime.fromisoformat(user["expire_at"])
     except Exception:
-        return "نامشخص"
+        return "Unknown"
     delta = exp - datetime.now()
     days = delta.days
     if days < 0:
-        return "منقضی شده"
+        return "Expired"
     if days == 0:
         hours = max(0, int(delta.total_seconds() // 3600))
-        return f"{hours} ساعت"
-    return f"{days} روز"
+        return f"{hours}h"
+    return f"{days}d"
 
 
 async def build_fake_info_link(user) -> str:
-    """یک کانفیگ نمایشی (غیرفعال/الکی) می‌سازد که هیچ کارکرد واقعی‌ای نداره و فقط
-    برای نمایش حجم و زمان باقیمانده در اسم کانفیگ، داخل لیست کلاینت کاربر استفاده میشه.
-    مشخصات فنی این کانفیگ اهمیتی نداره چون قرار نیست واقعا بهش وصل بشه."""
+    """A display-only dummy config with no real functionality. It's only used
+    to show remaining traffic/days inside the name shown in the user's client app.
+    The technical parameters don't matter since it's never actually connected to."""
     from urllib.parse import quote
 
-    remaining_traffic = _fmt_remaining_traffic(user)
-    remaining_days = _fmt_remaining_days(user)
+    remaining_traffic = _fmt_remaining_traffic_en(user)
+    remaining_days = _fmt_remaining_days_en(user)
 
-    label = f"📊 حجم: {remaining_traffic} | ⏳ {remaining_days} مانده"
+    label = f"Info | {remaining_traffic} left | {remaining_days} left"
 
-    # uuid پایدار و مخصوص همین کاربر (هر بار یکسانه، که در کلاینت تکراری ساخته نشه)
+    # Stable uuid per-user (same every time, so the client doesn't duplicate it)
     fake_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"info:{user['uuid']}"))
     domain = DOMAIN
     sni = await get_setting("sni", domain)
@@ -326,7 +355,7 @@ async def build_subscription(user_uuid: str) -> str:
     if limit_bytes > 0 and user["used_traffic_bytes"] >= limit_bytes:
         return ""
 
-    # Get active clean IPs
+    # Get active clean IPs/domains
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
@@ -335,33 +364,22 @@ async def build_subscription(user_uuid: str) -> str:
             ips = await cur.fetchall()
 
     links = []
-    if ips:
-        # یه لینک برای هر IP تمیز — آدرس اتصال IP هست، SNI/host همون دامنه اصلی
-        for ip_row in ips:
-            ip_addr = ip_row["ip"]
-            ip_label = ip_row["label"] or ip_addr
-            # Include remaining traffic in label (option C)
-            limit_bytes = float(user["traffic_limit_gb"] or 0) * 1024 ** 3
-            used_bytes = int(user["used_traffic_bytes"] or 0)
-            remaining_bytes = max(0, int(limit_bytes - used_bytes)) if limit_bytes > 0 else 0
-            remaining_gb = round(remaining_bytes / 1024 ** 3, 2) if limit_bytes > 0 else 0
-            remaining_txt = f"{remaining_gb}GB" if limit_bytes > 0 else "∞"
-            display_name = f"{user['flag']} {user['name']} | {remaining_txt} left | {ip_label}".strip()
-            link = await build_vless_link(
-                user["uuid"],
-                display_name,
-                address=ip_addr,
-            )
-            links.append(link)
-    else:
-        # بدون IP تمیز — از دامنه اصلی استفاده کن (با نمایش حجم باقی‌مانده در لیبل)
-        limit_bytes = float(user["traffic_limit_gb"] or 0) * 1024 ** 3
-        used_bytes = int(user["used_traffic_bytes"] or 0)
-        remaining_bytes = max(0, int(limit_bytes - used_bytes)) if limit_bytes > 0 else 0
-        remaining_gb = round(remaining_bytes / 1024 ** 3, 2) if limit_bytes > 0 else 0
-        remaining_txt = f"{remaining_gb}GB" if limit_bytes > 0 else "∞"
-        display_name = f"{user['flag']} {user['name']} | {remaining_txt} left".strip()
-        link = await build_vless_link(user["uuid"], display_name, "")
+
+    # همیشه یک کانفیگ با خود دامنه پنل اضافه میشه (دامنه به‌عنوان یک آدرس تمیز در نظر گرفته میشه)
+    domain_name = (await get_setting("sni", DOMAIN)) or DOMAIN
+    domain_display = f"{user['flag']} {user['name']} | {domain_name}".strip()
+    links.append(await build_vless_link(user["uuid"], domain_display, address=DOMAIN))
+
+    # یک لینک برای هر IP/دامنه تمیز — آدرس اتصال عوض میشه، SNI/host همون دامنه اصلی میمونه
+    for ip_row in ips:
+        ip_addr = ip_row["ip"]
+        ip_label = ip_row["label"] or ip_addr
+        display_name = f"{user['flag']} {user['name']} | {ip_label}".strip()
+        link = await build_vless_link(
+            user["uuid"],
+            display_name,
+            address=ip_addr,
+        )
         links.append(link)
 
     fake_enabled = await get_setting("fake_info_config", "1")
@@ -371,6 +389,7 @@ async def build_subscription(user_uuid: str) -> str:
 
     content = "\n".join(links)
     return base64.b64encode(content.encode()).decode()
+
 
 async def build_subscription_userinfo_header(user_uuid: str) -> str:
     """Build Clash/Sing-box compatible Subscription-Userinfo header.
@@ -464,7 +483,7 @@ async def lifespan(app: FastAPI):
     await init_db()
     ka_task = asyncio.create_task(keepalive_loop())
     ex_task = asyncio.create_task(check_expiry_loop())
-    log.info(f"🚀 XRay Panel v{PANEL_VERSION} started on port {PORT}")
+    log.info(f"🚀 IranX Panel v{PANEL_VERSION} started on port {PORT}")
     yield
     ka_task.cancel()
     ex_task.cancel()
@@ -717,7 +736,9 @@ async def root():
 async def login(request: Request, response: Response, username: str = Form(...), password: str = Form(...)):
     ip = request.client.host
     ua = request.headers.get("user-agent", "")
-    success = username == ADMIN_USERNAME and password == ADMIN_PASSWORD
+    effective_username = await get_effective_admin_username()
+    password_ok = await verify_admin_password(password)
+    success = username == effective_username and password_ok
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT INTO login_logs (ip, user_agent, success, logged_at) VALUES (?,?,?,?)",
@@ -735,6 +756,19 @@ async def login(request: Request, response: Response, username: str = Form(...),
 @app.post("/api/logout")
 async def logout(response: Response):
     response.delete_cookie("session")
+    return {"ok": True}
+
+
+@app.post("/api/account/change-password")
+async def change_password(request: Request, auth=Depends(require_auth)):
+    data = await request.json()
+    current_password = data.get("current_password", "")
+    new_password = data.get("new_password", "")
+    if not new_password or len(new_password) < 8:
+        raise HTTPException(400, "رمز جدید باید حداقل ۸ کاراکتر باشد")
+    if not await verify_admin_password(current_password):
+        raise HTTPException(401, "رمز عبور فعلی اشتباه است")
+    await set_setting("admin_password_hash", hash_password(new_password))
     return {"ok": True}
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -870,17 +904,10 @@ async def get_sub_link(user_uuid: str, auth=Depends(require_auth)):
     if not user:
         raise HTTPException(404, "کاربر یافت نشد")
 
-    # Option C: include remaining traffic in label
-    limit_bytes = float(user["traffic_limit_gb"] or 0) * 1024 ** 3
-    used_bytes = int(user["used_traffic_bytes"] or 0)
-    remaining_bytes = max(0, int(limit_bytes - used_bytes)) if limit_bytes > 0 else 0
-    remaining_gb = round(remaining_bytes / 1024 ** 3, 2) if limit_bytes > 0 else 0
-    remaining_txt = f"{remaining_gb}GB" if limit_bytes > 0 else "∞"
-
-    vless_label = f"{user['flag']} {user['name']} | {remaining_txt} left".strip()
+    vless_label = f"{user['flag']} {user['name']} | {DOMAIN}".strip()
     vless = await build_vless_link(user["uuid"], vless_label, "")
 
-    # لینک‌های IP تمیز (اگه وجود داشت)
+    # لینک‌های IP/دامنه تمیز (اگه وجود داشت)
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT ip, label FROM clean_ips WHERE is_active=1") as cur:
@@ -891,7 +918,7 @@ async def get_sub_link(user_uuid: str, auth=Depends(require_auth)):
         ip_lbl = (ip_row['label'] or ip_row['ip'])
         lnk = await build_vless_link(
             user["uuid"],
-            f"{user['name']} | {remaining_txt} left | {ip_lbl}",
+            f"{user['name']} | {ip_lbl}",
             user["flag"],
             address=ip_row["ip"],
         )
@@ -920,12 +947,16 @@ async def add_ip(request: Request, auth=Depends(require_auth)):
     data = await request.json()
     ip = data.get("ip", "").strip()
     label = data.get("label", "").strip()
+    addr_type = data.get("type", "").strip().lower()
     if not ip:
-        raise HTTPException(400, "IP الزامی است")
+        raise HTTPException(400, "آدرس الزامی است")
+    if addr_type not in ("ip", "domain"):
+        ip_pattern = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$|^[0-9a-fA-F:]+$")
+        addr_type = "ip" if ip_pattern.match(ip) else "domain"
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT OR IGNORE INTO clean_ips (ip, label, added_at) VALUES (?,?,?)",
-            (ip, label, datetime.now().isoformat()),
+            "INSERT OR IGNORE INTO clean_ips (ip, label, type, added_at) VALUES (?,?,?,?)",
+            (ip, label, addr_type, datetime.now().isoformat()),
         )
         await db.commit()
     return {"ok": True}
@@ -936,19 +967,27 @@ async def bulk_add_ips(request: Request, auth=Depends(require_auth)):
     data = await request.json()
     ips_text = data.get("ips", "")
     added = 0
+    ip_pattern = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$|^[0-9a-fA-F:]+$")
+    domain_pattern = re.compile(r"^(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))+$")
     async with aiosqlite.connect(DB_PATH) as db:
         for line in ips_text.splitlines():
             line = line.strip()
             parts = line.split()
-            ip = parts[0] if parts else ""
+            addr = parts[0] if parts else ""
             label = " ".join(parts[1:]) if len(parts) > 1 else ""
-            ip_pattern = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$|^[a-fA-F0-9:]+$")
-            if ip and ip_pattern.match(ip):
-                await db.execute(
-                    "INSERT OR IGNORE INTO clean_ips (ip, label, added_at) VALUES (?,?,?)",
-                    (ip, label, datetime.now().isoformat()),
-                )
-                added += 1
+            if not addr:
+                continue
+            if ip_pattern.match(addr):
+                addr_type = "ip"
+            elif domain_pattern.match(addr):
+                addr_type = "domain"
+            else:
+                continue
+            await db.execute(
+                "INSERT OR IGNORE INTO clean_ips (ip, label, type, added_at) VALUES (?,?,?,?)",
+                (addr, label, addr_type, datetime.now().isoformat()),
+            )
+            added += 1
         await db.commit()
     return {"ok": True, "added": added}
 
@@ -1095,6 +1134,30 @@ def get_html(is_auth: bool) -> str:
     --radius: 16px;
     --radius-sm: 12px;
   }}
+
+  html[data-theme="light"] {{
+    --bg: #f1f5f9;
+    --bg2: #ffffff;
+    --bg3: #e9eef5;
+    --card: rgba(255,255,255,0.75);
+    --card2: rgba(255,255,255,0.9);
+    --border: rgba(15,23,42,0.10);
+    --border2: rgba(15,23,42,0.18);
+    --accent: #0891b2;
+    --accent2: #2563eb;
+    --accent3: #7c3aed;
+    --green: #059669;
+    --red: #e11d48;
+    --yellow: #d97706;
+    --blue: #2563eb;
+    --text: rgba(15,23,42,0.92);
+    --text2: rgba(51,65,85,0.78);
+    --text3: rgba(100,116,139,0.75);
+    --shadow: 0 10px 40px rgba(15,23,42,0.12);
+  }}
+
+  html, body {{ transition: background 0.3s ease, color 0.3s ease; }}
+  body, .sidebar, .topbar, .card, .stat-card, .modal, .login-card {{ transition: background 0.3s ease, color 0.3s ease, border-color 0.3s ease, box-shadow 0.3s ease, transform 0.25s ease; }}
 
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
   
@@ -1830,6 +1893,20 @@ def get_html(is_auth: bool) -> str:
 <script>
 const IS_AUTH = {'true' if is_auth else 'false'};
 
+// ─── THEME ──────────────────────────────────────────────────────────────────
+function apply_theme(theme) {{
+  document.documentElement.setAttribute('data-theme', theme === 'light' ? 'light' : 'dark');
+  const btn = document.getElementById('theme-toggle-btn');
+  if (btn) btn.innerHTML = theme === 'light' ? '<i class="fa fa-sun"></i>' : '<i class="fa fa-moon"></i>';
+}}
+function toggle_theme() {{
+  const current = localStorage.getItem('panel-theme') || 'dark';
+  const next = current === 'light' ? 'dark' : 'light';
+  localStorage.setItem('panel-theme', next);
+  apply_theme(next);
+}}
+apply_theme(localStorage.getItem('panel-theme') || 'dark');
+
 // ─── UTILITIES ────────────────────────────────────────────────────────────────
 function toast(msg, type='success') {{
   const c = document.getElementById('toast-container');
@@ -1897,7 +1974,7 @@ function render_login() {{
     <div class="login-card">
       <div class="login-logo">
         <div class="icon">⚡</div>
-        <h1>XRay Panel</h1>
+        <h1>IranX Panel</h1>
         <p>مدیریت اشتراک VLESS</p>
       </div>
       <form id="login-form">
@@ -1953,7 +2030,7 @@ function render_app() {{
       <div class="sidebar-logo">
         <div class="logo-icon">⚡</div>
         <div>
-          <h2>XRay Panel</h2>
+          <h2>IranX Panel</h2>
           <small>v{PANEL_VERSION}</small>
         </div>
       </div>
@@ -1967,7 +2044,7 @@ function render_app() {{
             <span class="nav-icon"><i class="fa fa-users"></i></span> کاربران
           </div>
           <div class="nav-item" data-page="ips" onclick="navigate('ips')">
-            <span class="nav-icon"><i class="fa fa-network-wired"></i></span> IP های تمیز
+            <span class="nav-icon"><i class="fa fa-network-wired"></i></span> IP / دامنه تمیز
           </div>
           <div class="nav-item" data-page="settings" onclick="navigate('settings')">
             <span class="nav-icon"><i class="fa fa-cog"></i></span> تنظیمات
@@ -1996,6 +2073,9 @@ function render_app() {{
           <div class="topbar-subtitle" id="page-subtitle">خوش آمدید</div>
         </div>
         <div class="topbar-actions">
+          <button class="btn btn-secondary btn-sm" id="theme-toggle-btn" onclick="toggle_theme()" title="تغییر تم">
+            <i class="fa fa-moon"></i>
+          </button>
           <button class="btn btn-secondary btn-sm" onclick="refresh_page()">
             <i class="fa fa-sync"></i>
           </button>
@@ -2036,7 +2116,7 @@ function navigate(page) {{
   const titles = {{
     dashboard: ['داشبورد', 'وضعیت کلی سیستم'],
     users: ['کاربران', 'مدیریت کاربران و اشتراک‌ها'],
-    ips: ['IP های تمیز', 'مدیریت آدرس‌های IP'],
+    ips: ['IP / دامنه تمیز', 'مدیریت آدرس‌های IP و دامنه'],
     settings: ['تنظیمات', 'پیکربندی پنل']
   }};
   document.getElementById('page-title').textContent = titles[page]?.[0] || page;
@@ -2499,12 +2579,12 @@ async function render_ips() {{
   el.innerHTML = `
   <div class="card" style="margin-bottom:20px">
     <div style="display:flex;gap:12px;flex-wrap:wrap">
-      <button class="btn btn-primary" onclick="show_add_ip_modal()"><i class="fa fa-plus"></i> افزودن IP</button>
+      <button class="btn btn-primary" onclick="show_add_ip_modal()"><i class="fa fa-plus"></i> افزودن IP / دامنه</button>
       <button class="btn btn-secondary" onclick="show_bulk_ip_modal()"><i class="fa fa-list"></i> افزودن انبوه</button>
     </div>
   </div>
   <div class="card">
-    <div class="card-title"><i class="fa fa-network-wired" style="color:var(--blue)"></i> IP های ثبت شده</div>
+    <div class="card-title"><i class="fa fa-network-wired" style="color:var(--blue)"></i> آدرس‌های تمیز ثبت شده</div>
     <div id="ips-table-wrapper"><div style="text-align:center;padding:40px;color:var(--text2)"><i class="fa fa-spinner spin fa-2x"></i></div></div>
   </div>`;
   await load_ips();
@@ -2521,15 +2601,16 @@ function render_ips_table() {{
   const el = document.getElementById('ips-table-wrapper');
   if (!el) return;
   if (ips_data.length === 0) {{
-    el.innerHTML = `<div class="empty-state"><div class="empty-icon">🌐</div><h3>IP ای وجود ندارد</h3><p>IP های تمیز اضافه کنید تا در لینک‌های اشتراک استفاده شوند</p></div>`;
+    el.innerHTML = `<div class="empty-state"><div class="empty-icon">🌐</div><h3>آدرسی وجود ندارد</h3><p>IP یا دامنه تمیز اضافه کنید تا در لینک‌های اشتراک استفاده شوند</p></div>`;
     return;
   }}
   el.innerHTML = `
   <div class="table-wrapper">
   <table>
-    <thead><tr><th>آدرس IP</th><th>برچسب</th><th>تاریخ افزوده</th><th>وضعیت</th><th>عملیات</th></tr></thead>
+    <thead><tr><th>نوع</th><th>آدرس</th><th>برچسب</th><th>تاریخ افزوده</th><th>وضعیت</th><th>عملیات</th></tr></thead>
     <tbody>
       ${{ips_data.map(ip => `<tr>
+        <td>${{ip.type==='domain'?'<span class="badge badge-purple"><i class="fa fa-globe"></i> دامنه</span>':'<span class="badge badge-blue"><i class="fa fa-server"></i> IP</span>'}}</td>
         <td><span class="ip-chip">${{ip.ip}}</span></td>
         <td>${{ip.label || '<span style="color:var(--text3)">—</span>'}}</td>
         <td>${{format_date(ip.added_at)}}</td>
@@ -2552,11 +2633,17 @@ function show_add_ip_modal() {{
   overlay.innerHTML = `
   <div class="modal">
     <div class="modal-header">
-      <div class="modal-title">➕ افزودن IP تمیز</div>
+      <div class="modal-title">➕ افزودن IP / دامنه تمیز</div>
       <button class="modal-close" onclick="this.closest('.modal-overlay').remove()"><i class="fa fa-times"></i></button>
     </div>
     <div class="modal-body">
-      <div class="form-group"><label>آدرس IP *</label><input id="ip-addr" type="text" placeholder="1.2.3.4" dir="ltr"></div>
+      <div class="form-group"><label>نوع</label>
+        <select id="ip-type">
+          <option value="ip">آدرس IP</option>
+          <option value="domain">دامنه</option>
+        </select>
+      </div>
+      <div class="form-group"><label>آدرس *</label><input id="ip-addr" type="text" placeholder="1.2.3.4 یا clean.example.com" dir="ltr"></div>
       <div class="form-group"><label>برچسب (اختیاری)</label><input id="ip-label" type="text" placeholder="فرانکفورت"></div>
     </div>
     <div class="modal-footer">
@@ -2570,10 +2657,11 @@ function show_add_ip_modal() {{
 async function add_ip() {{
   const ip = document.getElementById('ip-addr')?.value?.trim();
   const label = document.getElementById('ip-label')?.value?.trim() || '';
-  if (!ip) {{ toast('IP الزامی است','error'); return; }}
+  const type = document.getElementById('ip-type')?.value || 'ip';
+  if (!ip) {{ toast('آدرس الزامی است','error'); return; }}
   try {{
-    await api('POST', '/api/ips', {{ip, label}});
-    toast('IP اضافه شد');
+    await api('POST', '/api/ips', {{ip, label, type}});
+    toast('آدرس اضافه شد');
     document.querySelector('.modal-overlay')?.remove();
     await load_ips();
   }} catch(e) {{ toast(e.message,'error'); }}
@@ -2585,14 +2673,14 @@ function show_bulk_ip_modal() {{
   overlay.innerHTML = `
   <div class="modal">
     <div class="modal-header">
-      <div class="modal-title">📋 افزودن انبوه IP</div>
+      <div class="modal-title">📋 افزودن انبوه IP / دامنه</div>
       <button class="modal-close" onclick="this.closest('.modal-overlay').remove()"><i class="fa fa-times"></i></button>
     </div>
     <div class="modal-body">
       <div class="form-group">
-        <label>IP ها (هر خط یک IP)</label>
-        <textarea id="bulk-ips" placeholder="1.2.3.4 آلمان&#10;5.6.7.8 هلند&#10;9.10.11.12" style="min-height:150px;direction:ltr"></textarea>
-        <small style="color:var(--text3);font-size:12px;margin-top:4px;display:block">فرمت: IP فضا برچسب (برچسب اختیاری است)</small>
+        <label>آدرس‌ها (هر خط یک IP یا دامنه)</label>
+        <textarea id="bulk-ips" placeholder="1.2.3.4 آلمان&#10;clean.example.com هلند&#10;9.10.11.12" style="min-height:150px;direction:ltr"></textarea>
+        <small style="color:var(--text3);font-size:12px;margin-top:4px;display:block">فرمت: آدرس فضا برچسب (برچسب اختیاری است) — نوع (IP یا دامنه) به‌صورت خودکار تشخیص داده میشه</small>
       </div>
     </div>
     <div class="modal-footer">
@@ -2643,7 +2731,7 @@ async function render_settings() {{
       <div>
         <div class="card">
           <div class="card-title"><i class="fa fa-sliders-h" style="color:var(--accent)"></i> تنظیمات پنل</div>
-          <div class="form-group"><label>عنوان پنل</label><input id="s-title" value="${{s.panel_title||'XRay Panel'}}"></div>
+          <div class="form-group"><label>عنوان پنل</label><input id="s-title" value="${{s.panel_title||'IranX Panel'}}"></div>
         </div>
         
         <div class="card">
@@ -2711,15 +2799,66 @@ async function render_settings() {{
             </div>
           </div>
         </div>
+
+        <div class="card">
+          <div class="card-title"><i class="fa fa-palette" style="color:var(--accent3)"></i> ظاهر پنل</div>
+          <div class="form-group" style="margin-bottom:0">
+            <label>تم پنل</label>
+            <div style="display:flex;gap:10px">
+              <button type="button" id="theme-opt-dark" class="btn btn-secondary" style="flex:1;justify-content:center" onclick="set_theme_option('dark')"><i class="fa fa-moon"></i> تیره</button>
+              <button type="button" id="theme-opt-light" class="btn btn-secondary" style="flex:1;justify-content:center" onclick="set_theme_option('light')"><i class="fa fa-sun"></i> روشن</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title"><i class="fa fa-shield-alt" style="color:var(--red)"></i> امنیت حساب</div>
+          <div class="form-group"><label>رمز عبور فعلی</label><input id="s-cur-pass" type="password" dir="ltr" placeholder="••••••••"></div>
+          <div class="form-group"><label>رمز عبور جدید</label><input id="s-new-pass" type="password" dir="ltr" placeholder="حداقل ۸ کاراکتر"></div>
+          <div class="form-group"><label>تکرار رمز عبور جدید</label><input id="s-new-pass2" type="password" dir="ltr" placeholder="حداقل ۸ کاراکتر"></div>
+          <button class="btn btn-danger" style="width:100%" onclick="change_password()"><i class="fa fa-key"></i> تغییر رمز عبور</button>
+        </div>
         
         <button class="btn btn-primary" onclick="save_settings()" style="width:100%">
           <i class="fa fa-save"></i> ذخیره تنظیمات
         </button>
       </div>
     </div>`;
+    set_theme_option(localStorage.getItem('panel-theme') || 'dark', true);
   }} catch(e) {{
     el.innerHTML = `<div class="card"><p style="color:var(--red)">${{e.message}}</p></div>`;
   }}
+}}
+
+function set_theme_option(theme, skip_apply) {{
+  if (!skip_apply) {{
+    localStorage.setItem('panel-theme', theme);
+    apply_theme(theme);
+  }}
+  const d = document.getElementById('theme-opt-dark');
+  const l = document.getElementById('theme-opt-light');
+  if (d && l) {{
+    d.classList.toggle('btn-primary', theme !== 'light');
+    d.classList.toggle('btn-secondary', theme === 'light');
+    l.classList.toggle('btn-primary', theme === 'light');
+    l.classList.toggle('btn-secondary', theme !== 'light');
+  }}
+}}
+
+async function change_password() {{
+  const current_password = document.getElementById('s-cur-pass')?.value || '';
+  const new_password = document.getElementById('s-new-pass')?.value || '';
+  const new_password2 = document.getElementById('s-new-pass2')?.value || '';
+  if (!current_password) {{ toast('رمز عبور فعلی را وارد کنید','error'); return; }}
+  if (new_password.length < 8) {{ toast('رمز جدید باید حداقل ۸ کاراکتر باشد','error'); return; }}
+  if (new_password !== new_password2) {{ toast('تکرار رمز عبور مطابقت ندارد','error'); return; }}
+  try {{
+    await api('POST', '/api/account/change-password', {{current_password, new_password}});
+    toast('رمز عبور با موفقیت تغییر کرد ✓');
+    document.getElementById('s-cur-pass').value = '';
+    document.getElementById('s-new-pass').value = '';
+    document.getElementById('s-new-pass2').value = '';
+  }} catch(e) {{ toast(e.message,'error'); }}
 }}
 
 async function save_settings() {{

@@ -1,8 +1,8 @@
-# XRay Panel Configuration
+# IranX Panel Configuration
 # This file is for reference only. Set actual values as environment variables.
 
 [panel]
-title = "XRay Panel"
+title = "IranX Panel"
 version = "1.0.0"
 
 [server]

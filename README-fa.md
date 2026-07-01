@@ -1,4 +1,4 @@
-# ⚡ XRay Panel
+# ⚡ IranX Panel
 
 [![Python](https://img.shields.io/badge/Python-3.11-blue)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.111-green)](https://fastapi.tiangolo.com/)
